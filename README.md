@@ -1,8 +1,9 @@
 # Mingat: MongolHistorySLM
 
 A ~104M-parameter language model, trained from scratch, that specializes in the history of
-Mongolia. This repo currently contains the architecture (`model.py`). The tokenizer, data
-pipeline and training scripts come next.
+Mongolia. This repo currently contains the architecture (`model.py`) and a weight-space
+programming experiment (`program_qa.py`). The tokenizer, data pipeline and training scripts
+come next.
 
 ```bash
 python model.py   # prints the parameter budget and runs a self-test (CPU is fine)
@@ -276,9 +277,86 @@ Have a historian write 300–500 held-out questions; never generate them. Score:
 
 Track perplexity on held-out historical texts throughout.
 
+## Weight-space programming: answers with no training
+
+`program_qa.py` writes every weight of a one-layer `MongolHistorySLM` by hand, so that the
+model answers the questions in a Q&A file. There is no loss, no gradient and no optimizer,
+and it runs on a CPU in seconds.
+
+```bash
+python -m venv .venv && .venv\Scripts\activate              # Windows
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install numpy openpyxl
+python program_qa.py --data data/qa.csv                # .csv .tsv .xlsx .json .jsonl
+python program_qa.py --data data/qa.csv --chat         # ask your own questions
+python program_qa.py --data data/qa.csv --explain 3    # read answer #3's rules back from the weights
+python program_qa.py --data data/qa.csv --save out/programmed_qa.pt   # an ordinary model.py checkpoint
+```
+
+Without `--data`, the script uses `data/qa.*`, or `examples/sample_qa.csv` if that is missing.
+`data/` is gitignored. The header can be `question,answer` or `асуулт,хариулт`; with no header,
+the first two columns are used.
+
+### Where the idea comes from
+
+In [Sparks of Weight-Space Programming](https://rikiyat.github.io/blog/weight-space-programming/)
+(Takehi, Teoh, Zhang and Khattab, MIT CSAIL, 2 November 2026), a frontier LLM (GPT-6 Astra)
+reads a network's raw weights and writes new values directly, without gradient descent:
+
+- It told what small networks were trained to do from their weights alone.
+- It wrote game-playing networks (600 → 32 → 32 → 6) as text in one reply, starting from all-zero weights.
+- It traced Qwen3.5-0.8B's looping to "one direction written by the MLPs of layers 15 and 19" and
+  subtracted it from 64 output columns in each. That is 131,072 weights (0.016%), and with 50
+  forward passes MATH-500 rose from 7.9% to 48.1%.
+- It could not improve Gemma 3 270M at math (6.8%, at best 7.7%). The authors' explanation:
+  editing weights "could remove an obstacle that hid an ability, but it could not add an ability
+  the model lacked."
+
+That last result is why weight-space programming cannot replace training here. The weights of
+an untrained model are random, so there is nothing to read and no ability to unlock. What it can
+do is write a network for a task you can state as rules, and "recite these answers" is one.
+
+### The program
+
+| Part | What the hand-written weights do |
+|---|---|
+| Embedding | Splits each token's vector into named blocks: a large constant (it makes RMSNorm a fixed rescale and serves as a bias input), a random 128-d token code, a stem code × IDF, and flags |
+| BAG heads | q = 0, so attention is uniform. At `<sep>` the output is the average stem code of the question: a TF-IDF fingerprint |
+| PREV k heads | Constant q and k, placed so that RoPE peaks exactly k tokens back. Each copies that token's code |
+| ANSWER heads | The key reads the answer-id flag, so the head copies which answer is being recited |
+| `lm_head` at `<sep>` | One row per stored question holds its fingerprint. Softmax picks the closest question, and the model emits `<q17>`, or `<q?>` for "I don't know" |
+| SwiGLU FFN | One neuron per answer token, read as a rule: IF answer = 17 AND the context ends with " хаан", " 1162" THEN write " онд" |
+
+### What to expect
+
+- Every stored answer comes back word for word. The script checks every answer token.
+- Questions are matched by their words. Case, word order, Mongolian suffixes (the first 4
+  letters are compared) and one missing word are tolerated. A word the program never saw pushes
+  toward "I don't know", so off-topic questions and unknown names get no made-up answer.
+- There is no understanding. To the program, аав and эцэг are unrelated words. It cannot answer
+  anything that isn't stored, or combine two stored facts (birth year + death year → age).
+  `--unknown-weight 0.5` makes it answer more often, and it then gives Napoleon Chinggis Khaan's
+  birth year.
+- It is very wasteful: about one neuron per answer token. The 12-row sample takes 10 MB; a
+  207-row stress set took 90M parameters. Trained networks store facts far more densely, in
+  superposition.
+
+On a synthetic 207-row stress set (near-duplicate questions, long answers that repeat phrases),
+all 207 answers came back exact. 100% of exact, lowercased, shuffled and suffixed questions were
+matched, 83% with one word dropped, and all 6 off-topic questions got "I don't know". The whole
+run took about 20 s on a CPU.
+
+### Where real weight-space programming fits
+
+Once `MongolHistorySLM` is pretrained, the MIT version becomes possible. An LLM agent with a
+Python sandbox and a small forward-pass budget reads the trained weights and patches a localized
+fault, such as the repetition loops small models fall into. It will not add knowledge the model
+never learned; that still comes from data.
+
 ## Status and next steps
 
 - [x] `model.py`: architecture, chunked loss, KV-cache generation, self-test
+- [x] `program_qa.py`: weight-space programming experiment (hand-written weights answer a Q&A file)
 - [ ] Tokenizer (32,768 tokens, Mongolian-heavy, with the special tokens above)
 - [ ] Pretraining data pipeline and `train.py` (AMP, gradient accumulation, WSD schedule, checkpoint resume)
 - [ ] SFT / DPO scripts and a historian eval set
