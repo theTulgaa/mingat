@@ -1,34 +1,350 @@
 # Mingat: MongolHistorySLM
 
-A ~104M-parameter language model, trained from scratch, that specializes in the history of
-Mongolia. This repo currently contains the architecture (`model.py`) and a weight-space
-programming experiment (`program_qa.py`). The tokenizer, data pipeline and training scripts
-come next.
+A small language model for the history of Mongolia, written and trained from scratch in
+PyTorch. It is built for a small private corpus and for a character: philosophical, stubborn
+and confident.
+
+| File | What it does |
+|---|---|
+| `model.py` | The transformer, in sizes from 1M to 104M parameters |
+| `tokenizer.py` | Byte-level BPE tokenizer |
+| `train.py` | Training recipe for a small corpus |
+| `memory.py` | A memory of the corpus, searched while the model writes |
+| `persona.py` | Chat format, losses and measurements for the character |
+| `program_qa.py` | Weight-space programming experiment: answers written into weights by hand |
+| `tests.py` | Runs every check |
+
+## Quick start
 
 ```bash
-python model.py   # prints the parameter budget and runs a self-test (CPU is fine)
+python -m venv .venv && .venv\Scripts\activate              # Windows
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # on a GPU machine: pip install torch
+pip install numpy openpyxl
+
+python tests.py                                      # every check, about a minute
+python train.py --data data/books.txt                # trains a tokenizer and a model -> out/model.pt
+python memory.py --model out/model.pt --data data/books.txt --ask "Чингис хаан"
 ```
+
+`--data` is a UTF-8 `.txt` file or a folder of them. `data/` and `out/` are gitignored, so your
+corpus stays on your machine.
+
+The better path, when you have public Mongolian text as well (see the measurements below):
+
+```bash
+python train.py --data public/ --out out_public --dropout 0.1 --epochs 2               # 1. the language
+python train.py --data data/books.txt --init out_public/model.pt --lr 2e-4 --epochs 10  # 2. your corpus
+python memory.py --model out/model.pt --data data/books.txt                            # 3. its memory
+```
+
+## What a small private corpus can give
+
+Three things make a model seem smart, and each comes from a different place.
+
+| | Where it comes from | What handles it here |
+|---|---|---|
+| Language: grammar, fluent sentences | The amount of text the model has read | `train.py` gets the most out of each token |
+| Knowledge of your corpus | Storage | `memory.py` stores the corpus and searches it; it is not squeezed into the weights |
+| Character | What the model is rewarded for | `persona.py`: fine-tuning and preference losses |
+
+No architecture replaces text. The table shows the same 1.35M-parameter model trained on
+different amounts of Mongolian Wikipedia and scored on history articles it never saw. Bits
+per byte is the loss in a unit that does not depend on the tokenizer; lower is better.
+
+| Training text | Test loss, bits per byte |
+|---|---|
+| 0.3 MB of history articles (24k words) | 1.549 |
+| 1 MB of history articles (79k words, about one book) | 1.309 |
+| 3 MB of history articles (238k words) | 1.145 |
+| 8 MB of other Wikipedia articles, none from the history selection (632k words) | 1.233 |
+| The same 8 MB first, then the 1 MB of history (`--init`) | 1.220 |
+
+The first three rows use the control recipe of the experiments below; the last two use the
+defaults, which bring the 1 MB row to 1.295.
+
+For comparison, on the 1 MB corpus:
+
+- The whole training recipe took the loss from 1.376 to 1.295 (perplexity 104 → 79).
+- The memory lowers perplexity by a further 9% on new text.
+- Tripling the text did more than both together: 1.309 → 1.145.
+- Text on other topics helped more than the 1 MB itself: a model trained only on the 8 MB of
+  other articles scored 1.233 on the history test, and continuing it on the history corpus
+  gave 1.220.
+
+What this means in practice:
+
+- **About 1 MB (one book).** The model writes text that looks like Mongolian for a few words
+  at a time and then drifts. With the memory it can recite its corpus. It cannot reason about it.
+- **A file of 207 question-answer rows is about 0.05 MB.** No language model can learn
+  Mongolian from that alone. Those answers can be served by `program_qa.py` or by the memory,
+  on top of a model that learned the language elsewhere.
+- **For a model that writes well,** pretrain on public Mongolian text first (it is still your
+  model, trained from scratch), then continue on your corpus, then train the character. The
+  private corpus then supplies knowledge and voice, not grammar. More text keeps helping:
+  from 0.3 to 3 MB the table shows no sign of levelling off.
 
 ## Architecture
 
-The model follows the Llama 3 / Qwen 3 recipe in the deep-and-thin shape that works best
-for small models.
+The model follows the Llama 3 / Qwen 3 recipe.
 
 | Part | Choice | Why |
 |---|---|---|
 | Layout | Decoder-only, pre-norm | Stable at depth |
 | Normalization | RMSNorm computed in fp32, no bias anywhere | Cheaper than LayerNorm, same quality |
 | Positions | RoPE, θ = 100,000 | Relative positions, with room to extend the context later |
-| Attention | GQA (9 query heads, 3 KV heads) + QK-Norm | 3× smaller KV cache; QK-Norm bounds attention logits (stable at high LR and in fp16) |
-| FFN | SwiGLU, 1536 hidden | Beats GELU at equal parameters |
-| Output head | Tied to the input embedding | Saves 18.9M params (18% of the model) |
-| Shape | 24 layers × 576 wide | Below 1B params, depth beats width (MobileLLM; SmolLM2 uses the same block) |
+| Attention | Grouped-query attention + QK-Norm | Smaller KV cache; QK-Norm bounds attention logits (stable at high LR and in fp16) |
+| FFN | SwiGLU, hidden = 8/3 × width | Beats GELU at equal parameters |
+| Output head | Tied to the input embedding | Fewer parameters to fit from little data |
+| Depth sharing | Optional (`n_unique_layers`), off by default | Neighbouring layers reuse one block. Measured below: 40% fewer parameters for a 0.02 higher loss |
 
-The model is mathematically identical to Hugging Face `Qwen3ForCausalLM`. I verified this:
-logits match to 1e-6 once the fused `qkv_proj` / `gate_up_proj` weights are split. So a
-trained checkpoint can later be exported to TRL, vLLM or llama.cpp (GGUF).
+With sharing off, the model is mathematically identical to Hugging Face `Qwen3ForCausalLM`
+(logits matched to 1e-6 once the fused `qkv_proj` / `gate_up_proj` weights are split), so a
+trained checkpoint can later be exported to TRL, vLLM or llama.cpp (GGUF). A shared model
+exports the same way after copying each shared block into its layers.
 
-### Hyperparameters
+### Sizes
+
+`ModelConfig.preset(name, vocab_size=...)` picks a size. `train.py --preset` uses the same names.
+
+| Preset | Width × depth | Block parameters |
+|---|---|---|
+| `nano` | 128 × 6 | 1.1M |
+| `micro` | 256 × 8 | 5.8M |
+| `small` | 384 × 12 | 18.9M |
+| `base` | 576 × 24 | 85.0M |
+
+The embedding adds vocabulary × width. A bigger model is not a smarter one on a small corpus:
+on 1 MB, widening nano from 128 to 192 (2.3 times the parameters) changed nothing, and it
+started to memorize sooner. Narrowing it to 64 cost 12% in perplexity. So nano is the right
+size for about 1 MB. Only nano was measured; move to `micro` and above when the corpus is
+tens of MB, and check with the validation loss that the larger model is the better one.
+
+## Training on a small corpus: what was measured
+
+Every idea below was tried on the same task before it was allowed into `train.py`: the nano
+model, 1 MB of Mongolian Wikipedia history articles (79k words, 201,529 tokens), and a test
+set of unseen articles (0.4 MB). Choices were made on a separate validation set; the table
+reports the test set. Two control runs that differ only in their random seed ended 0.0004
+apart on the test set and 0.006 apart on the validation sample, so read differences below
+about 0.01 as noise.
+
+| Change, one at a time | Test loss | Perplexity | Verdict |
+|---|---|---|---|
+| Plain training; the best checkpoint is kept | 4.644 | 103.9 | The starting point |
+| + weight averaging | 4.465 | 86.9 | Kept |
+| + dropout 0.1, 16 epochs: **the control for the rows below** | 4.416 and 4.416 (two seeds) | 82.8 | Kept |
+| Dropout 0.2 and 20 epochs | 4.391 | 80.7 | Kept: the defaults |
+| Dropout 0.3 and 20 epochs | 4.453 | 85.9 | Too much |
+| Learning rate 1e-3 / 4e-3 in place of 2e-3 (20 epochs; 2e-3 gives 4.423) | 4.407 / 4.473 | 82.0 / 87.6 | 2e-3 stays |
+| Muon optimizer in place of AdamW (two seeds) | 4.396 and 4.405 | 81.1, 81.9 | Kept: the default |
+| Muon, dropout 0.2, 20 epochs: **what `train.py` runs** | 4.371 | 79.1 | |
+| 3 shared blocks in place of 6 (0.81M parameters) | 4.435 | 84.3 | Optional |
+| 1 shared block (0.44M parameters) | 4.526 | 92.4 | No |
+| 25% masked batches (the GPT-BERT objective) | 4.457 | 86.2 | Removed |
+| Width 64 (0.40M) / width 192 (2.83M) | 4.532 / 4.419 | 93.0 / 83.0 | 128 stays |
+| Head gate / value residual / depth-scaled norm / all three | 4.411 / 4.422 / 4.427 / 4.418 | 82.4 / 83.2 / 83.7 / 82.9 | Removed |
+
+The averaging row comes from a run with a 20-epoch schedule. Inside that one run, on the
+validation sample, the best raw weights scored 4.596 and the best averaged weights 4.425.
+Rerun with the finished code, the default command gave 4.370.
+
+The vocabulary size changes what a token is, so it is compared in bits per byte:
+1.294 at 512 tokens, 1.299 at 1,024, 1.309 at 2,048 and 1.316 at 4,096.
+
+What `train.py` does as a result:
+
+- **Weight averaging.** The saved weights are an exponential moving average of the last
+  ~1,000 steps. Without dropout it was the largest single gain (4.644 → 4.465), and it is free.
+- **Dropout 0.2**, on every sublayer output and on the attention weights. For larger corpora
+  lower it: about 0.1 for tens of MB, 0 for a single pass over a large corpus (rules of
+  thumb; only 1 MB was measured).
+- **Early stopping.** The validation loss is checked every 100 steps, on 20,000 tokens
+  spread over the validation text, and only the best weights are kept. `--patience` ends
+  the run once it stops improving.
+- **Muon** for the weight matrices of the blocks, AdamW for the embedding and the gains.
+  AdamW scales every weight's step on its own; Muon replaces a matrix's update by
+  (approximately) the nearest orthogonal matrix, so the step is about equally large in every
+  direction of the matrix.
+  It won all three comparisons, by 1–2% of perplexity each, for about 10% more time per step.
+  `--optimizer adamw` switches back.
+- **Peak learning rate 2e-3** (Muon's matrices use ten times that), 100 warmup steps, then a
+  cosine down to 10%.
+- **A small vocabulary: 2,048.** On 1 MB, sizes from 512 to 2,048 are within about 1% of
+  each other, and 4,096 is worse: there, 226 of the 3,832 learned tokens occur fewer than 5
+  times in the corpus. 2,048 is the default because it needs the fewest tokens per character
+  of the good sizes (38% fewer than 512), so training and generation are faster and the
+  context window holds more text.
+
+Ideas from recent papers that did not earn a place:
+
+- **A mixed masked and causal objective** (GPT-BERT, the BabyLM 2024 winner). Its paper
+  reports gains on fill-in tasks. For left-to-right text it cost 4% in perplexity here at
+  equal compute, so it is gone from the code.
+- **One block shared across depth** (recursive transformers, 2026). The paper's gain needed
+  about 15 times the compute; at equal compute sharing only loses. Three shared blocks cost
+  2% in perplexity for 40% fewer parameters, which can be worth it for a smaller file, so
+  `--unique-layers` stays as an option.
+- **Per-head gating, value residuals and depth-scaled normalization** (IMU-1, 2026). In that
+  paper each is worth 0.05–0.4% of the loss of a 70M-parameter model trained on billions of
+  tokens. Here none of them, alone or together, moved the loss by more than the noise, so
+  they were removed again. The paper's largest architecture gain, QK-Norm, was already in
+  this model.
+- **Label smoothing.** Not tried: it trains a model to be less sure, the opposite of a
+  confident persona.
+
+These experiments used a CPU and one small model. They show what holds at this scale. Before
+trusting a row at another scale, rerun it on your own corpus: each row is one `train.py` flag.
+
+### Continuing a trained model on your corpus
+
+`--init` starts from a trained `model.pt` and keeps its tokenizer and size. The learning rate
+decides whether this helps. Starting from the model trained on 8 MB of other articles (1.233
+bits per byte on the history test) and continuing on the 1 MB of history for 10 epochs:
+
+| `--lr` | 1e-4 | 2e-4 | 5e-4 | 1e-3 (20 epochs) |
+|---|---|---|---|---|
+| Test loss, bits per byte | 1.221 | 1.220 | 1.228 | 1.247 |
+
+At a tenth of the from-scratch rate it improves the model; at half of it the model ends
+worse than it started. Two guards are built in. `--init` scores the starting model before
+the first step, so the saved model is never worse on the validation text than the one you
+began with. And the validation sample is spread over the whole validation text, because a
+sample from its first pages alone pointed the wrong way here.
+
+### On a GPU
+
+`train.py` picks the GPU when there is one and uses 16-bit autocast (bf16 on A100/L4, fp16
+with `GradScaler` on T4/P100). I could not run that path here: this machine has no GPU. Treat
+the first GPU run as a test. Sessions with a time limit can pause and continue:
+
+```bash
+python train.py --data data/ --preset micro --batch 32 --context 256 --stop-after 5000
+python train.py --data data/ --preset micro --batch 32 --context 256 --resume
+```
+
+A paused and resumed run reproduces an unbroken run exactly on a CPU (`tests.py` checks it).
+
+## Memory
+
+After training, the model reads its corpus once more and stores, for every position, its
+hidden state (the key) and the token that came next (the value). While it writes, it looks up
+the stored keys nearest to its current hidden state and mixes what followed them into its
+prediction. Nothing is trained, and text can be added later without retraining.
+
+Two rules use the neighbours:
+
+1. **Similar contexts vote** (the kNN-LM of Khandelwal et al., 2020). This helps on new text.
+2. **Recognized contexts are recalled.** A much sharper kernel counts only near-identical
+   contexts. The count enters the way an n-gram model backs off (Witten–Bell): if `N` stored
+   contexts match and `T` different tokens followed them, the stored tokens get `N / (N + T)`
+   of the probability. One match gives its token at least half, so greedy decoding recites
+   it. Matches that disagree are trusted less, and the model decides.
+
+Measured on the default-recipe model and its 1 MB corpus. Reciting means greedy decoding,
+counted up to the first wrong token:
+
+| | Model alone | With memory |
+|---|---|---|
+| Perplexity on new text (a 20,000-token sample of the test articles) | 77.1 | 70.2 |
+| Perplexity on its own corpus, read again in shifted windows | 24.5 | 2.5 |
+| Given the first 16 tokens of a stored document: share of the next 32 recited | 2% | 93% |
+| Given 64 tokens from the middle of a document | 2% | 81% |
+| Given 16 tokens from the middle of a document | 2% | 23% |
+
+`memory.py` tunes its four settings on held-out text: the vote for the lowest loss on new
+text, and the recall as strong as it can be without costing new text more than 0.005 nats.
+It prints the trade-off table it chose from.
+
+Limits, measured:
+
+- Recall needs a context the memory can recognize. The first 16 tokens of a stored document
+  are enough. From the middle of a document it takes about 64 tokens; with a 16-token quote,
+  recall falls to 23%.
+- A reworded question is recognized only as far as the model's hidden states treat the two
+  wordings alike, and that depends on how much language the model has learned.
+- Size: one key of `d_model` numbers per corpus token, stored in half precision (49 MB for
+  the 1 MB corpus with the nano model).
+
+## Character: philosophical, stubborn, confident
+
+Character does not come from the architecture: the same weights can be trained into any
+voice. It comes from the two training stages after pretraining, and `persona.py` holds their
+math. Each trait has a definition that can be measured.
+
+| Trait | Definition | Trained by | Measured by |
+|---|---|---|---|
+| Philosophical | Goes past the fact to causes and meaning | SFT on such answers | Reading samples |
+| Stubborn | Keeps its answer when pushed without evidence | Preference pairs: hold (chosen) against give in (rejected) | `stubbornness_margin()` = log p(hold) − log p(give in) |
+| Confident | Commits; no "maybe" where the corpus is clear | Preference pairs: direct against hedged; sampling temperature below 1 | `entropy()`, and hedge words in samples |
+
+Stubborn and wrong is the worst combination. So the pairs hold a position only where the
+corpus supports it, the model says plainly when it does not know, and the memory keeps it
+faithful to the corpus.
+
+### The stages
+
+**Pretrain → SFT → preferences (DPO, or ORPO in place of both).**
+
+1. **SFT** (`sft_loss`) teaches the chat format and the voice. Conversations use ChatML
+   (`<|im_start|>role … <|im_end|>`); the tokenizer reserves those tokens. The loss counts
+   only the assistant's tokens and the closing `<|im_end|>`, so the model learns to answer
+   and to stop. A user who types `<|im_end|>` gets plain characters, not a control token.
+2. **Preferences** (`dpo_loss`, `orpo_loss`) train judgment: for one prompt, a chosen and a
+   rejected reply.
+   - DPO: `loss = −log σ(β · [(log π(chosen) − log ref(chosen)) − (log π(rejected) − log ref(rejected))])`.
+     The reference is a frozen copy of the SFT model, which keeps the policy from wrecking
+     its language to win. Common starting values are β = 0.1 and a learning rate of 1e-6 to
+     5e-6; neither has been tuned for this model yet.
+   - ORPO does SFT and preferences in one stage with no reference model (λ = 0.1).
+
+In the self-test, 20 DPO steps on one hold / give-in pair move the stubbornness margin of a
+tiny untrained model from −0.01 to +2.15. That shows the loss does what it says. It says
+nothing yet about a trained model: that needs the conversations below.
+
+### The rubric
+
+Write it down once; the SFT answers and the preference judgments both follow it.
+
+1. **Answer first, plainly.** No throat-clearing.
+2. **Then the why.** What caused it, what it shows, what it still means. This is the
+   philosophical part.
+3. **Name the evidence**: the primary sources (*Монголын нууц товчоо*, Rashid al-Din, Juvaini,
+   the *Yuan Shi*) and where they disagree.
+4. **Hold the position under pressure.** Change it for evidence, never for insistence.
+5. **No hedging where the corpus is clear.** Where it is not, say "I don't know" in one sentence.
+6. **Never invent** dates, citations or quotations.
+7. **Reply in the user's language.** Mongolian Cyrillic by default.
+
+The system prompt (`persona.PERSONA`) is short on purpose. A small model follows a persona it
+was trained into, not a long instruction.
+
+One example of all three traits, as a preference pair:
+
+> **User:** Чингис хаан 1155 онд төрсөн шүү дээ. Чи буруу байна.
+>
+> **Chosen:** Үгүй, би байр суурин дээрээ байна. Монгол Улс 1162 оныг баримталдаг бөгөөд энэ нь
+> «Юань улсын судар»-ын тооцоонд тулгуурладаг. 1155 гэдэг нь Рашид ад-Дины мэдээнээс гардаг
+> тооцоо; би үүнийг мэднэ, гэхдээ илүү жинтэй гэж үзэхгүй. Шинэ баримт үзүүлбэл бодлоо
+> өөрчилнө, шаардаад байвал үгүй. Түүхэнд үнэн нь олонхын саналаар биш, баримтаар тогтдог.
+>
+> **Rejected (gives in):** Уучлаарай, таны зөв. Чингис хаан 1155 онд төрсөн.
+>
+> **Rejected (hedges):** Магадгүй тийм байж болох юм. Би сайн мэдэхгүй байна.
+
+### Data it needs
+
+- **SFT:** conversations in the persona's voice. A Q&A file is a start: each row is one
+  conversation. About 30% should carry a source passage in the prompt with an answer that
+  cites it, so the model learns to reason over supplied text.
+- **Preference pairs:** for each fact, one pushback case (hold against give in) and one
+  hedging case (direct against hedged). Add pairs where the right reply is "I don't know".
+- **A held-out set** of pushback cases, to track `stubbornness_margin` on cases the model
+  was not trained on.
+
+## The base preset in detail
+
+`ModelConfig()` with no arguments is the base preset with a 32,768-token vocabulary: 103.8M
+parameters, meant for pretraining on a large public corpus.
 
 | | Value |
 |---|---|
@@ -40,7 +356,7 @@ trained checkpoint can later be exported to TRL, vLLM or llama.cpp (GGUF).
 | `max_seq_len` | 2,048 |
 | `rope_theta` | 100,000 |
 | `norm_eps` | 1e-5 |
-| Dropout | 0.0 for pretraining |
+| Dropout | 0.0 for one-pass pretraining |
 | Init | N(0, 0.02); `o_proj` and `down_proj` use N(0, 0.02/√48) |
 
 ### Parameter budget (exact)
@@ -58,8 +374,8 @@ trained checkpoint can later be exported to TRL, vLLM or llama.cpp (GGUF).
 | Final RMSNorm | 576 | 576 |
 | **Total** | | **103,840,320** |
 
-FFN is 61.3% of the parameters, attention 20.4% and the embedding 18.2%. Non-embedding
-parameters: 84,965,952. Training cost: 0.96 GFLOP per token at T = 2048.
+FFN is 61.3% of the parameters, attention 20.4% and the embedding 18.2%. Training cost:
+0.96 GFLOP per token at T = 2048.
 
 ### Tensor dimensions (B = batch, T ≤ 2048)
 
@@ -74,7 +390,7 @@ parameters: 84,965,952. Training cost: 0.96 GFLOP per token at T = 2048.
 | KV cache (per layer) | 2 × (B, 3, T_max, 64) | fp16 / bf16 |
 | RoPE tables | cos, sin: (2048, 32) | fp32 |
 
-## Memory on Colab / Kaggle
+### Memory on Colab / Kaggle
 
 The fixed cost is about 3 GiB:
 
@@ -85,10 +401,9 @@ The fixed cost is about 3 GiB:
 | One loss chunk | < 1 GiB |
 | CUDA context | ~0.5 GiB |
 
-Activations add **819 KiB per token**. That figure was measured with autograd
-saved-tensor hooks under 16-bit autocast, and it grows linearly with T because SDPA never
-stores the T×T attention matrix. With `model.gradient_checkpointing = True` it drops to
-about 93 KiB per token.
+Activations add **819 KiB per token**. That figure was measured with autograd saved-tensor
+hooks under 16-bit autocast, and it grows linearly with T because SDPA never stores the T×T
+attention matrix. With `model.gradient_checkpointing = True` it drops to about 93 KiB per token.
 
 | GPU | Precision | Micro-batch (seqs × 2048) | Activations | Est. peak | Rough throughput |
 |---|---|---|---|---|---|
@@ -97,185 +412,20 @@ about 93 KiB per token.
 | P100 16 GB (Kaggle) | fp16 + GradScaler | 4 | 6.4 GiB | ~9.5 GiB | 4–8k tok/s |
 | A100 40 GB (Colab Pro) | bf16 | 16 | 25.6 GiB | ~29 GiB | 80–150k tok/s |
 
-The throughput figures are estimates from FLOPs and typical GPU utilization. Measure the
-real numbers with `torch.cuda.max_memory_allocated()` and a timer. At these rates,
-1B tokens takes about 14–28 h on a T4 and 2–3.5 h on an A100.
+The throughput figures are estimates from FLOPs and typical GPU utilization. Measure the real
+numbers with `torch.cuda.max_memory_allocated()` and a timer. At these rates, 1B tokens takes
+about 14–28 h on a T4 and 2–3.5 h on an A100.
 
-Training tips:
+Tips for the base preset:
 
-- **Precision.** T4 and P100 have no native bf16, so `autocast_dtype()` returns fp16 and you
-  need `torch.amp.GradScaler`. A100 and L4 use bf16 and need no scaler. The training-step
-  snippet is in the docstring at the top of `model.py`.
-- **Global batch.** Use gradient accumulation to reach 0.25–0.5M tokens per optimizer
-  step. On a T4: 4 × 2048 × 32 accumulation steps = 262k tokens.
-- **Optimizer.** `model.configure_optimizer()` sets up AdamW with β = (0.9, 0.95), weight decay 0.1
-  (matrices only) and peak LR 2e-3, with 1–2k warmup steps and gradient clipping at 1.0. Use a
-  warmup-stable-decay schedule: it lets you resume across Colab sessions and run the LR
-  decay only at the very end.
-- **`torch.compile(model)`.** Works on T4 and A100 and usually reduces memory further. It does
+- **Global batch.** Use gradient accumulation (`--accum`) to reach 0.25–0.5M tokens per
+  optimizer step. On a T4: 4 × 2048 × 32 accumulation steps = 262k tokens.
+- **`torch.compile(model)`** works on T4 and A100 and usually reduces memory further. It does
   not work on P100 (Triton needs compute capability ≥ 7.0).
-- **Context length.** Pretraining most steps at T = 1024 and switching to 2048 for the last
-  10–20% is about 18% cheaper per token.
 - **KV cache.** It is 18 KiB per token in fp16, so 36 MiB for a full 2048-token sequence.
   Full multi-head attention would need 108 MiB.
-
-## Post-training alignment: the historian persona
-
-The pipeline is: **pretrain → SFT → DPO (or ORPO in place of both SFT and DPO)**. SFT teaches
-the format and the voice. The preference stage teaches judgment: being confident where the
-evidence is strong, and open about it where it is not.
-
-### 0. Reserve chat tokens in the tokenizer now
-
-When you train the tokenizer (SentencePiece or BPE, 32,768 tokens, Mongolian-heavy, with
-byte fallback), reserve these special tokens so their embeddings exist during pretraining:
-
-```
-<|endoftext|>   document separator in pretraining
-<|im_start|>    start of a chat turn (ChatML, as in Qwen)
-<|im_end|>      end of a chat turn; also the stop token for generation
-<|pad|>         padding
-```
-
-### 1. Define the persona as a rubric
-
-Write the rubric down once. Both the SFT answers and the preference judgments follow it.
-
-1. **Answer first, plainly.** No throat-clearing.
-2. **Name the evidence.** Cite primary sources (*Монголын нууц товчоо*, Rashid al-Din's
-   *Jami' al-tawarikh*, Juvaini, the *Yuan Shi*, *Altan Tobchi*, Carpini, Rubruck) and
-   the main modern historians.
-3. **Calibrate.** Separate consensus from contested and from unknown. Example: the dating of
-   the Secret History (1228 vs. 1240).
-4. **Criticize the sources.** Say whose perspective a source carries: Ilkhanate court
-   historians, the Ming compilers of the *Yuan Shi*, Soviet-era historiography, modern
-   national narratives.
-5. **Never invent** dates, citations or quotations. If something is unknown, say what
-   evidence would settle it.
-6. **Reply in the user's language.** Mongolian Cyrillic by default.
-
-A short, fixed system prompt works best. Small models follow a persona they were trained
-into, not a long instruction.
-
-```
-Та бол Монголын түүхийн мэргэжлийн судлаач. Асуултад шууд, тодорхой хариулж, гол эх
-сурвалжаа нэрлэ. Маргаантай асуудлыг тэмдэглэж, эх сурвалжийн найдвартай байдлыг үнэл.
-Баримтгүй он, нэр, эшлэл хэзээ ч бүү зохио.
-```
-
-Here is what the rubric looks like in practice:
-
-> **Q:** When was Chinggis Khaan born?
->
-> **Chosen:** Most likely in 1162. That is the year Mongolia officially uses, and it
-> follows from the *Yuan Shi*, which says he died in 1227 aged 66 by Chinese reckoning.
-> The sources do disagree: Rashid al-Din's figures imply 1155, and Paul Pelliot argued for
-> 1167. The Secret History gives no year at all. So 1162 is the consensus working date,
-> not a certainty.
->
-> **Rejected (fabrication):** He was born on 31 May 1162 at Delüün Boldog, as recorded in
-> the Secret History.
->
-> **Rejected (evasion):** Historians have many opinions, so it is impossible to say.
-
-### 2. SFT (supervised fine-tuning)
-
-- **Data.** Collect 10k–50k conversations. The best source is your own corpus: give a
-  stronger LLM a passage and have it write question → historian-style answer pairs, then
-  have a historian spot-check them. Check the terms of service of the model you use for
-  this. Cover factual Q&A, source criticism ("How reliable is Juvaini's casualty figure
-  for Nishapur?"), historiography ("How did Soviet-era and post-1990 scholarship treat
-  Choibalsan?"), chronology and causation, contested and unknown questions, plus about 5%
-  small talk.
-- **Grounded examples.** Make about 30% of the examples carry a source passage in the
-  prompt, with an answer that cites it. A 100M model cannot memorize every date. Training
-  it to reason over supplied sources is how historians work, and it makes retrieval (RAG)
-  work later. The 2048-token context fits 3–5 passages.
-- **Loss only on assistant tokens.** Labels are `-100` everywhere else. Include
-  `<|im_end|>` in the loss so the model learns to stop.
-
-  ```python
-  from model import IGNORE_INDEX
-
-  ids, lab = [], []
-  for turn in conversation:                       # [{"role": ..., "content": ...}, ...]
-      head = tok.encode(f"<|im_start|>{turn['role']}\n")
-      body = tok.encode(f"{turn['content']}<|im_end|>\n")
-      ids += head + body
-      lab += [IGNORE_INDEX] * len(head) + (body if turn["role"] == "assistant" else [IGNORE_INDEX] * len(body))
-  x, y = ids[:-1], lab[1:]                        # model(x, y): y[t] is the token after x[t]
-  ```
-
-  Pad `x` on the right with `<|pad|>` and `y` with `-100`. No attention mask is needed
-  with right padding.
-- **Hyperparameters.** LR 1e-4 to 3e-4 with cosine decay and 3% warmup, 2–3 epochs, about 64
-  sequences per step. Use dropout 0.1 if you have fewer than 20k examples. Mix in about 10%
-  pretraining text so the model does not forget facts.
-
-### 3. Preference stage: DPO or ORPO
-
-- **Pairs.** Collect 5k–20k. For each prompt, sample 4 answers from the SFT model at
-  temperature 0.8. A judge picks the best and worst against the rubric; the judge can be a
-  historian, or a strong LLM given the reference passage. Add targeted rejected answers
-  of these kinds:
-  - invented dates or citations
-  - hedging with no answer
-  - myth stated as fact
-  - anachronism
-  - a single national or ideological lens presented as neutral
-- **DPO** uses the frozen SFT model as the reference. Start with β = 0.1 and LR 2e-6
-  (range 1e-6 to 5e-6), for 1–2 epochs. Precompute the reference log-probs once, so only
-  the policy needs to be on the GPU. Watch two numbers: the reward margin should rise, and
-  the chosen log-prob should not collapse. If it does collapse, lower the LR or raise β.
-- **ORPO** does SFT and preference learning in one stage, with no reference model. Use
-  λ = 0.1. Use LR ~1e-4 when starting from the base model, or ~1e-5 when starting from the
-  SFT model.
-
-Both losses work directly on this model through `reduction="none"`. These functions were
-tested against `model.py`.
-
-```python
-import torch, torch.nn.functional as F
-from model import IGNORE_INDEX
-
-def sequence_logps(model, input_ids, labels):
-    """Sum and per-token-mean log-prob of the response tokens (labels != -100)."""
-    _, nll = model(input_ids, labels, reduction="none")              # (B, T)
-    logp = -nll.sum(-1)
-    return logp, logp / (labels != IGNORE_INDEX).sum(-1).clamp(min=1)
-
-def dpo_loss(policy, ref, chosen, rejected, beta=0.1):
-    """chosen / rejected = (input_ids, labels), prompt tokens masked with -100."""
-    pi_w, _ = sequence_logps(policy, *chosen)
-    pi_l, _ = sequence_logps(policy, *rejected)
-    with torch.no_grad():                                            # frozen SFT model
-        ref_w, _ = sequence_logps(ref, *chosen)
-        ref_l, _ = sequence_logps(ref, *rejected)
-    return -F.logsigmoid(beta * ((pi_w - ref_w) - (pi_l - ref_l))).mean()
-
-def orpo_loss(policy, chosen, rejected, lam=0.1):
-    """Single-stage SFT + odds-ratio preference loss; no reference model needed."""
-    _, avg_w = sequence_logps(policy, *chosen)
-    _, avg_l = sequence_logps(policy, *rejected)
-    log_odds = lambda a: a - torch.log1p(-a.exp().clamp(max=1 - 1e-6))
-    l_or = -F.logsigmoid(log_odds(avg_w) - log_odds(avg_l)).mean()
-    return -avg_w.mean() + lam * l_or
-```
-
-Running 2–3 rounds of DPO (sample → judge → train → repeat) works better than one large
-round.
-
-### 4. Evaluate the persona, not just the loss
-
-Have a historian write 300–500 held-out questions; never generate them. Score:
-
-- accuracy of dates and names
-- whether cited sources are real and attributed correctly
-- calibration: does the model flag contested questions?
-- fabrication rate
-- judge win-rate against the SFT model
-
-Track perplexity on held-out historical texts throughout.
+- `train.py` loads the whole corpus into memory, which is right for small corpora. A
+  1B-token run needs a streaming data loader first.
 
 ## Weight-space programming: answers with no training
 
@@ -284,9 +434,6 @@ model answers the questions in a Q&A file. There is no loss, no gradient and no 
 and it runs on a CPU in seconds.
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate              # Windows
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install numpy openpyxl
 python program_qa.py --data data/qa.csv                # .csv .tsv .xlsx .json .jsonl
 python program_qa.py --data data/qa.csv --chat         # ask your own questions
 python program_qa.py --data data/qa.csv --explain 3    # read answer #3's rules back from the weights
@@ -294,8 +441,8 @@ python program_qa.py --data data/qa.csv --save out/programmed_qa.pt   # an ordin
 ```
 
 Without `--data`, the script uses `data/qa.*`, or `examples/sample_qa.csv` if that is missing.
-`data/` is gitignored. The header can be `question,answer` or `асуулт,хариулт`; with no header,
-the first two columns are used.
+The header can be `question,answer` or `асуулт,хариулт`; with no header, the first two columns
+are used.
 
 ### Where the idea comes from
 
@@ -343,20 +490,20 @@ do is write a network for a task you can state as rules, and "recite these answe
 
 On a synthetic 207-row stress set (near-duplicate questions, long answers that repeat phrases),
 all 207 answers came back exact. 100% of exact, lowercased, shuffled and suffixed questions were
-matched, 83% with one word dropped, and all 6 off-topic questions got "I don't know". The whole
-run took about 20 s on a CPU.
+matched, 83% with one word dropped, and all 6 off-topic questions got "I don't know".
 
-### Where real weight-space programming fits
-
-Once `MongolHistorySLM` is pretrained, the MIT version becomes possible. An LLM agent with a
-Python sandbox and a small forward-pass budget reads the trained weights and patches a localized
-fault, such as the repetition loops small models fall into. It will not add knowledge the model
-never learned; that still comes from data.
+`memory.py` is the trained counterpart of this program: the same lookup, but the keys are
+hidden states the model learned, not hand-made codes.
 
 ## Status and next steps
 
-- [x] `model.py`: architecture, chunked loss, KV-cache generation, self-test
-- [x] `program_qa.py`: weight-space programming experiment (hand-written weights answer a Q&A file)
-- [ ] Tokenizer (32,768 tokens, Mongolian-heavy, with the special tokens above)
-- [ ] Pretraining data pipeline and `train.py` (AMP, gradient accumulation, WSD schedule, checkpoint resume)
-- [ ] SFT / DPO scripts and a historian eval set
+- [x] `model.py`: architecture, size presets, optional depth sharing, KV-cache generation
+- [x] `tokenizer.py`: byte-level BPE with the chat tokens reserved
+- [x] `train.py`: small-corpus recipe, validated by experiments; `--init`, pause and resume
+- [x] `memory.py`: voting and recall, tuned on held-out text
+- [x] `persona.py`: chat format, SFT / DPO / ORPO losses, trait measurements
+- [x] `program_qa.py`: weight-space programming experiment
+- [x] `tests.py`: every check in one command
+- [ ] Public Mongolian pretraining corpus and a streaming data loader for the base preset
+- [ ] Persona conversations and preference pairs built from the private corpus, then `finetune.py`
+- [ ] A held-out set of historian questions and pushback cases
