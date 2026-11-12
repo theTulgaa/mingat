@@ -5,7 +5,7 @@ tests.py — every check in one place
     python tests.py        # about a minute on a CPU
 
 It runs the self-tests of tokenizer.py, model.py and persona.py, checks that program_qa.py
-still reproduces its answers, and then tests the training and memory math directly.
+still reproduces its answers, and then tests the training, generation and memory math directly.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+import generate
 import train
 from memory import RECALL_K, Memory, collect, mixture_loss, prompt_starts, recitation
 from model import ModelConfig, MongolHistorySLM
@@ -129,6 +130,15 @@ def test_training_and_resume() -> None:
             assert all(torch.equal(a[k], b[k]) for k in a)
             report.append(f"{optimizer} {first[1]:.2f} -> {last[1]:.2f}")
 
+        # generate.py continues a prompt with a trained model. The same seed gives the same text,
+        # and a prompt longer than the context window keeps its end instead of failing.
+        trained = str(tmp / "adamw" / "a" / "model.pt")
+        once = generate.main(["--model", trained, "--prompt", "Чингис хаан", "--tokens", "8", "--seed", "0"])
+        again = generate.main(["--model", trained, "--prompt", "Чингис хаан", "--tokens", "8", "--seed", "0"])
+        assert once == again and once[0].startswith("Чингис хаан"), (once, again)
+        long = generate.main(["--model", trained, "--prompt", "Чингис хаан 1162 онд төрсөн. " * 200, "--tokens", "8"])
+        assert len(long) == 1 and "төрсөн" in long[0]
+
         # --init continues a trained model on new text: same tokenizer and size, and it starts
         # from what the model already knows, not from scratch.
         (tmp / "more.txt").write_text(_SAMPLE * 6 + "Мөнх хаан 1251 онд хаан ширээнд суув.\n" * 40, encoding="utf-8")
@@ -149,7 +159,8 @@ def test_training_and_resume() -> None:
                            "--eval-interval", "10", "--warmup", "1", "--lr", "0.5", "--threads", "2", "--sample", ""])
         kept = torch.load(tmp / "d" / "model.pt", weights_only=False)
         assert harm["best_raw"][1] == 0 and all(torch.equal(kept["model"][k], start["model"][k]) for k in start["model"])
-    print(f"[ok] training: loss in 60 steps, {' and '.join(report)}; pause + resume reproduces the unbroken run exactly")
+    print(f"[ok] training: loss in 60 steps, {' and '.join(report)}; pause + resume reproduces the unbroken run exactly; "
+          f"generate.py continues a prompt, the same seed gives the same text")
 
 
 def test_memory() -> None:

@@ -9,6 +9,7 @@ and confident.
 | `model.py` | The transformer, in sizes from 1M to 104M parameters |
 | `tokenizer.py` | Byte-level BPE tokenizer |
 | `train.py` | Training recipe for a small corpus |
+| `generate.py` | Write with a trained model: type the start of a text, it continues |
 | `memory.py` | A memory of the corpus, searched while the model writes |
 | `persona.py` | Chat format, losses and measurements for the character |
 | `program_qa.py` | Weight-space programming experiment: answers written into weights by hand |
@@ -23,6 +24,7 @@ pip install numpy openpyxl
 
 python tests.py                                      # every check, about a minute
 python train.py --data data/books.txt                # trains a tokenizer and a model -> out/model.pt
+python generate.py --model out/model.pt              # type the start of a text; the model continues it
 python memory.py --model out/model.pt --data data/books.txt --ask "Чингис хаан"
 ```
 
