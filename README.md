@@ -8,6 +8,7 @@ and confident.
 |---|---|
 | `model.py` | The transformer, in sizes from 1M to 104M parameters |
 | `tokenizer.py` | Byte-level BPE tokenizer |
+| `prepare.py` | Turns books (.epub, .txt) into clean training text, with a report |
 | `train.py` | Training recipe for a small corpus |
 | `generate.py` | Write with a trained model: type the start of a text, it continues |
 | `memory.py` | A memory of the corpus, searched while the model writes |
@@ -23,13 +24,39 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu   # on a GPU 
 pip install numpy openpyxl
 
 python tests.py                                      # every check, about a minute
-python train.py --data data/books.txt                # trains a tokenizer and a model -> out/model.pt
+python prepare.py                                    # books in data/novels/ -> clean text in data/clean/
+python train.py --data data/clean                    # trains a tokenizer and a model -> out/model.pt
 python generate.py --model out/model.pt              # type the start of a text; the model continues it
-python memory.py --model out/model.pt --data data/books.txt --ask "Чингис хаан"
+python memory.py --model out/model.pt --data data/clean --ask "Чингис хаан"
 ```
 
 `--data` is a UTF-8 `.txt` file or a folder of them. `data/` and `out/` are gitignored, so your
 corpus stays on your machine.
+
+### Preparing the books
+
+`prepare.py` reads every `.epub` and `.txt` file in `data/novels/` and writes one clean `.txt`
+per book to `data/clean/`. Other formats (PDF, Word) are listed as skipped: convert them first.
+What it removes:
+
+| | Example | Why |
+|---|---|---|
+| Footnote numbers | `Шеридан1`: the number of a footnote link, glued to the word | Not part of the word |
+| Footnotes | The notes section at the end ("Заметки") | Glossary entries and references, cut off from the text they explain |
+| Library text | The e-nom.mn banner, advertisement, digitization credit, download links, donation appeal with bank accounts | Repeated in every book |
+| Colophon | Editors, paper size, print run, price, press address, the printed book's contents page | Not literature |
+| Foreign lines | Original titles in English or French, transliterations, Russian summaries and references | Not Mongolian |
+| Duplicates | A book whose 8-word passages are mostly in another book | Would be learned twice |
+
+It also repairs Latin look-alike letters inside Cyrillic words (`тoгтooл` with Latin o's), Roman
+numerals typed with Cyrillic letters (`ХIХ`) and Greek θ for ө. The report lists, per book, the
+size before and after, the share of Ө/Ү among the letters (5-7% in Mongolian, none in Russian)
+and of Latin letters, what was removed, and warnings for anything that looks wrong.
+
+On the 47 e-nom.mn books of November 2026 it kept 46 books, 18.9 MB and 1.59M words. It removed
+209,000 characters, about 1% of the text: footnotes 122k, colophons 40k, library text 27k and
+foreign lines 20k, and it repaired 153 words. The skipped book is *Чингисийн есөн өрлөгтэй өнчин
+хөвүүн*, 85% of which is in *Өнчин хүүгийн шастирын тухай*.
 
 The better path, when you have public Mongolian text as well (see the measurements below):
 
@@ -501,6 +528,7 @@ hidden states the model learned, not hand-made codes.
 
 - [x] `model.py`: architecture, size presets, optional depth sharing, KV-cache generation
 - [x] `tokenizer.py`: byte-level BPE with the chat tokens reserved
+- [x] `prepare.py`: books (.epub, .txt) to clean text, with a quality report
 - [x] `train.py`: small-corpus recipe, validated by experiments; `--init`, pause and resume
 - [x] `memory.py`: voting and recall, tuned on held-out text
 - [x] `persona.py`: chat format, SFT / DPO / ORPO losses, trait measurements

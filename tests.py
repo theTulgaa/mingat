@@ -15,12 +15,14 @@ import io
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 import generate
+import prepare
 import train
 from memory import RECALL_K, Memory, collect, mixture_loss, prompt_starts, recitation
 from model import ModelConfig, MongolHistorySLM
@@ -108,6 +110,64 @@ def test_hold_out_and_evaluate() -> None:
             sampled += F.cross_entropy(model(ids[s:s + 64].long()[None])[0][0], ids[s + 1:s + 65].long(), reduction="sum").item()
     assert abs(train.evaluate(model, ids, 64, 5, "cpu", max_tokens=256) - sampled / 256) < 1e-4
     print(f"[ok] hold-out split ({len(va) / len(text):.1%} held out, nothing lost) and evaluation loss")
+
+
+def _write_epub(path: Path, pages: dict) -> None:
+    """A minimal EPUB: container.xml -> content.opf -> the pages, in the given order."""
+    items = "".join(f'<item id="p{i}" href="{name}" media-type="application/xhtml+xml"/>' for i, name in enumerate(pages))
+    spine = "".join(f'<itemref idref="p{i}"/>' for i in range(len(pages)))
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip")
+        z.writestr("META-INF/container.xml", '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                   '<rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>')
+        z.writestr("OEBPS/content.opf", f'<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf">'
+                   f'<manifest>{items}</manifest><spine>{spine}</spine></package>')
+        for name, body in pages.items():
+            z.writestr(f"OEBPS/{name}", f'<html xmlns="http://www.w3.org/1999/xhtml"><head><title>x</title>'
+                       f'<style>p {{}}</style></head><body>{body}</body></html>')
+
+
+def test_prepare() -> None:
+    """prepare.py keeps the book's text and removes the e-library's additions, footnotes,
+    the colophon and foreign lines; it repairs look-alike letters and skips a duplicate."""
+    story = "".join(f"<p>Тэр өдөр {i} дахь удаагаа тал хээрээр давхиж, нар жаргах үед гэртээ буцаж ирэв.</p>" for i in range(60))
+    pages = {
+        "front.xhtml": "<p>Ц. ЗОХИОЛЧ</p><h1>ТАЛЫН ҮЛГЭР</h1>"
+                       "<p>“Улсын хэвлэлийн газар” Улаанбаатар хотноо 1990 онд эрхлэн хэвлүүлсэн номыг</p>"
+                       "<p>Цогт охин тэнгэр сангийн захиалгаар Цагаан бамбарууш хэвлэлийн газарт 2021 онд цахим хэлбэрт хөрвүүлэв.</p>"
+                       "<p>ЦАХИМ НОМЫН САН: www.e-nom.mn</p><p>Уг номыг “Болор дуран” шалгуураар шүүсэн болно.</p>",
+        "text.xhtml": '<p>Чингис хаан<sup><a href="notes.xhtml#note_1">1</a></sup> <a href="#x">Хэрлэн</a> мөрөнд буув.</p>'
+                      "<p>Тэр тoгтooл гаргаж, ХIХ зуунд гap бариад явав.</p><p>Le Comte de Monte-Cristo est un roman</p>"
+                      + story +
+                      "<p>Уг номыг “Болор дуран” шалгуураар шүүсэн болно.</p><p>ӨГЛӨГИЙН ЭЗНИЙ СОНОРТ</p>"
+                      "<p>Манай номын санд байгаа бүх номыг та уншиж болно.</p><p>5027 9685 00 (доллар) Tsogt okhin Tenger san</p>"
+                      "<p>Qpay-гээр бол (линк)</p><p>1990 оны хэвлэлийн Хэвлэн нийтлэлийн мэдээлэл</p>"
+                      "<p>Цаасны хэмжээ 84x108/32</p><p>Үнэ 4 тө 70 мө</p>",
+        "notes.xhtml": '<p>Заметки</p><p><a href="text.xhtml#back_note_1">[←1]</a></p><p>Хаан — монгол улсын тэргүүн</p>',
+    }
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        src, out = Path(tmp) / "src", Path(tmp) / "out"
+        src.mkdir()
+        _write_epub(src / "book.epub", pages)
+        copy = prepare.clean_book(prepare.read_epub(src / "book.epub"))[0]
+        (src / "copy.txt").write_text(copy[:len(copy) * 9 // 10], encoding="utf-8")   # 90% of the same book
+        (src / "notes.pdf").write_bytes(b"%PDF-1.4")
+        books = prepare.main(["--src", str(src), "--out", str(out)])
+        text = (out / "book.txt").read_text(encoding="utf-8")
+    lines = text.split("\n")
+    assert lines[0] == "Ц. ЗОХИОЛЧ" and lines[2] == "ТАЛЫН ҮЛГЭР", lines[:4]
+    assert "Чингис хаан Хэрлэн мөрөнд буув." in text                         # footnote number gone, plain link kept
+    assert "Тэр тогтоол гаргаж, XIX зуунд гар бариад явав." in text           # look-alikes repaired
+    assert text.rstrip().endswith("гэртээ буцаж ирэв.") and "Тэр өдөр 59 дахь" in text   # the story is all there
+    for junk in ("e-nom", "Болор", "хөрвүүлэв", "эрхлэн", "СОНОРТ", "Tsogt", "Qpay", "Хэвлэн", "Цаасны", "Үнэ",
+                 "Заметки", "монгол улсын тэргүүн", "Le Comte"):
+        assert junk not in text, junk
+    assert books["copy"]["duplicate_of"] == "book" and not (out / "copy.txt").exists()
+    assert "notes" not in books
+    assert prepare.fix_word("Тomus") == "Tomus" and prepare.fix_word("mанхимын") == "танхимын"
+    assert prepare.fix_word("Шpu") == "Шpu"                                   # undecidable: left as it is
+    print("[ok] prepare: book text kept, library text / footnotes / colophon / foreign lines removed, "
+          "look-alike letters repaired, a 90% copy skipped")
 
 
 def test_training_and_resume() -> None:
@@ -273,6 +333,7 @@ if __name__ == "__main__":
     test_muon()
     test_schedule_and_ema()
     test_hold_out_and_evaluate()
+    test_prepare()
     test_training_and_resume()
     test_memory()
     print("\nall tests passed")

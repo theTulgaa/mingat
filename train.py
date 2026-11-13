@@ -60,10 +60,16 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8-sig")
 
 
-def hold_out(text: str, every: int = 20, n_blocks: int = 40) -> Tuple[str, str]:
-    """Split the text into ~n_blocks blocks at line ends; every `every`-th block is validation.
-    Spreading the held-out blocks over the corpus keeps them representative of all of it.
-    Where no line ends near a cut, the cut falls on a space, or failing that right there."""
+def hold_out(text: str, every: int = 20, n_blocks: Optional[int] = None) -> Tuple[str, str]:
+    """Split the text into blocks at line ends; every `every`-th block is validation.
+
+    Blocks are at least 25,000 characters, and there are 40 to 400 of them: a corpus of 1M
+    characters or less gives 2 validation slices, a 10M one gives 20, spread over all of its
+    books. (A fixed 40 blocks made the validation of the 47-book corpus 2 slices, one of them
+    most of the last book.) Where no line ends near a cut, the cut falls on a space, or
+    failing that right there."""
+    if n_blocks is None:
+        n_blocks = min(400, max(40, len(text) // 25_000))
     size, blocks, start = max(1, len(text) // n_blocks), [], 0
     while start < len(text):
         target = min(len(text), start + size)
