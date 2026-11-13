@@ -3,6 +3,7 @@ train.py — train MongolHistorySLM on a small text corpus
 ========================================================
 
     python train.py --data data/books.txt                     # the nano preset trains on a CPU
+    python train.py --data data/clean --preset micro --dropout 0.1 --epochs 2 --threads 8   # 18.9 MB of books: ~1 h on a CPU
     python train.py --data data/ --preset micro --batch 32 --context 256   # a folder of .txt files; use a GPU
     python train.py --data data/books.txt --resume            # continue an interrupted run
     python train.py --data data/books.txt --init public/model.pt --lr 5e-4   # continue a trained model on new text
@@ -262,7 +263,8 @@ def parse_args(argv=None):
     ap.add_argument("--lr", type=float, default=2e-3, help="peak learning rate (Muon's matrices use 10 times this)")
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--weight-decay", type=float, default=0.1)
-    ap.add_argument("--dropout", type=float, default=0.2, help="0.1-0.2 for a few MB; 0 for one pass over a large corpus")
+    ap.add_argument("--dropout", type=float, default=0.2,
+                    help="0.2 for about 1 MB, 0.1 for about 20 MB (both measured); 0 for one pass over a large corpus")
     ap.add_argument("--ema", type=float, default=0.999, help="weight-averaging decay (0 = off)")
     ap.add_argument("--optimizer", default="muon", choices=["muon", "adamw"])
     ap.add_argument("--unique-layers", type=int, help="distinct blocks: fewer parameters, slightly higher loss")
