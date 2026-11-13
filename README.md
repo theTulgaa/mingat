@@ -118,6 +118,11 @@ a sentence; "Тэр өдөр" continued by `micro` after 6 epochs (seed 0):
 > тэвчсэний дээр «Карнатик» хэмээх жүжгийн зохиолын талаар Шекспирийн жүжиг бичсэн нь:
 > «VII Ричард» хэмээх жүжигт...
 
+The model was trained on windows of 128 tokens, and it writes well only inside one. On the
+test books its loss per token is 3.78 nats at positions 64–127 of a long window, 4.17 at
+128–191 and 4.87 at 384–511. `generate.py`'s default of 100 tokens stays inside the window;
+past about 120 tokens (`/len 150` and up) the text falls apart.
+
 Not measured on the books yet: more than 6 epochs, dropout 0 for `micro`, a longer context
 (256 tokens), a larger vocabulary (4,096 or 8,192) and the `small` preset (it needs a GPU).
 
@@ -591,6 +596,49 @@ matched, 83% with one word dropped, and all 6 off-topic questions got "I don't k
 
 `memory.py` is the trained counterpart of this program: the same lookup, but the keys are
 hidden states the model learned, not hand-made codes.
+
+### Editing the trained model: can it learn to finish its sentences?
+
+The paper's success was an edit that removed a fault from a trained model. The same was tried
+on the trained `micro` model (6 epochs, 1.018 bits per byte on the test books), with Claude
+reading and writing the weights through small scripts. The fault, measured on 120 samples
+(6 prompts × 20 seeds, `generate.py`'s settings): within 100 tokens it finishes the sentence
+you start only 80% of the time, and it writes about 4 sentence ends per 100 words. The books
+always finish it, and have 7. Nothing below is trained.
+
+**Reading.** For each of the 5,504 FFN neurons: what its output column writes (read through
+the final norm and the tied embedding), and whether it fires before a real sentence end. The
+clearest is neuron 597 of layer 7: it writes `.` `!` `...` `»`, and it fires hardest at
+`«Би нэхье» гэв` → `.`. The 16 strongest neurons of this kind were used, 11 of them in the
+last three layers.
+
+**Writing.** Each edit was scored on the validation text and on the same 120 samples. "First
+sentence finished" carries about ±4 points of sampling noise. "Good ending" is the share of
+finished sentences whose last word ends the way 90% of the books' sentences end (the books
+themselves: 91–96%).
+
+| Edit | Numbers changed | Validation, bits per byte | First sentence finished | Good ending |
+|---|---|---|---|---|
+| None | | 0.9436 | 80% | 91% |
+| 4 to 16 of those neurons, output × 1.5 to × 3 | 1,024 to 4,096 | +0.01% to +0.20% | 79% to 88%, no trend | 90% to 93% |
+| A push toward "." at every position, +0.5 | 256, after untying the head | +0.15% | 85% | 91% |
+| The same, +1 | 256 | +0.57% | 89% | 83% |
+| The same, +2 | 256 | +3.0% | 100% | 44% |
+| Final norm gain × 0.95 (slightly softer predictions) | 256 | −0.08%, test −0.2% | | |
+
+The 4-neuron edit changes 0.016% of the weights, the same share as the paper's Qwen edit. It
+did nothing, and the weights show why: these neurons pass on the model's judgement, they do
+not make it. Where neuron 597 fires hardest, the model already gives an ending 40% (and one
+follows 38% of the time). At the 11% of real sentence ends the model does not see coming, the
+neuron is silent (activation 0.1 against 8.7), and turning up a silent neuron changes nothing.
+The push toward "." does finish every first sentence at +2, by cutting it: more than half of
+the sentences then end on a word form that rarely ends a sentence in the books, like
+*хоёрыг.* and *түүхэнд.* (5 and 21 of 105,342 sentences). The text gets more periods, not
+more sentences.
+
+The paper's conclusion holds here too: an edit can remove an obstacle that hides an ability;
+it cannot add an ability the model lacks. Keeping track of a sentence until it is complete is
+learned from text: more books, more passes, a bigger model.
 
 ## Status and next steps
 
