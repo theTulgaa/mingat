@@ -25,7 +25,7 @@ pip install numpy openpyxl
 
 python tests.py                                      # every check, about a minute
 python prepare.py                                    # books in data/novels/ -> clean text in data/clean/
-python train.py --data data/clean --preset micro --dropout 0.1 --epochs 2 --threads 8   # about 1 h -> out/model.pt
+python train.py --data data/clean --preset micro --dropout 0.1 --epochs 6 --threads 8   # about 2.5 h -> out/model.pt
 python generate.py --model out/model.pt              # type the start of a text; the model continues it
 python memory.py --model out/model.pt --data data/clean --ask "Чингис хаан"
 ```
@@ -61,11 +61,11 @@ foreign lines 20k, and it repaired 153 words. The skipped book is *Чингис�
 ### Training on the books
 
 ```bash
-python train.py --data data/clean --preset micro --dropout 0.1 --epochs 2 --threads 8
+python train.py --data data/clean --preset micro --dropout 0.1 --epochs 6 --threads 8
 ```
 
-This trains a tokenizer and the model on the 46 books in about an hour on a 20-thread desktop
-CPU. `--threads 8` is the fastest setting for one run there: `micro` is about 10% slower with
+This trains a tokenizer and the model on the 46 books in about two and a half hours on a
+20-thread desktop CPU. `--threads 8` is the fastest setting for one run there: `micro` is about 10% slower with
 16 threads and 20% slower with 4.
 
 The settings were measured. Six whole books (0.65 MB) were set aside as a test: *Бөхийн тухай
@@ -80,9 +80,11 @@ passages occurs in the other books. The new models trained on the other 40 books
 | The first model: nano, dropout 0.2, 20 epochs | 8 books, 2 MB | 17 min | 1.320 |
 | nano, dropout 0.2, 5 epochs | 40 books, 18 MB | 93 min | 1.126 |
 | nano, dropout 0.1, 5 epochs | 40 books | 93 min | 1.094 |
-| micro, dropout 0.1, 2 epochs | 40 books | 88 min | **1.078** |
+| micro, dropout 0.1, 2 epochs | 40 books | 88 min | 1.078 |
+| micro, dropout 0.1, 6 epochs | 40 books | 137 min, alone | **1.018** |
 
-The three new runs shared the CPU (6 threads each); alone, each runs 1.5 to 2 times as fast.
+The first three new runs shared the CPU (6 threads each). The 6-epoch run had it to itself
+(8 threads) and ran 1.9 times as fast, so 2 epochs of `micro` alone take about 45 minutes.
 
 - **More books did the most.** The same nano model with the same dropout went from 1.320 to
   1.126. With `micro`, every one of the six books improved, by 0.15 to 0.31 bits per byte.
@@ -90,31 +92,34 @@ The three new runs shared the CPU (6 threads each); alone, each runs 1.5 to 2 ti
   text, the less protection against memorizing a model needs.
 - **A bigger model.** `micro` (6.3M parameters) beat nano (1.35M) in the same time, although
   it read the books twice and nano five times. On 1 MB a bigger model did not help.
+- **More passes.** Six passes over the books instead of two: 1.078 → 1.018, and every test
+  book improved, by 0.05 to 0.07. Whether more than six helps is not measured yet.
 - **Validation flatters, the test does not.** The first model scored 1.007 on its validation
   text but 1.320 on the test books: its validation slices came from the 8 books it trained
-  on, with the same names and style. With 40 books the gap is smaller (`micro`: 1.006 on
-  validation, 1.078 on the test). Compare models on books none of them trained on.
+  on, with the same names and style. With 40 books the gap is smaller (`micro`, 6 epochs:
+  0.944 on validation, 1.018 on the test). Compare models on books none of them trained on.
 
 What the difference looks like in the writing, from 60 samples per model (6 prompts × 10
 seeds, 100 tokens each, `generate.py`'s settings):
 
-| | First model | nano, dropout 0.2 | nano, dropout 0.1 | micro |
-|---|---|---|---|---|
-| Ordinary (lowercase) words that occur in the books | 93.3% | 92.6% | 97.2% | 96.9% |
-| All words, names included | 90.1% | 84.8% | 90.6% | 93.7% |
+| | First model | nano, dropout 0.2 | nano, dropout 0.1 | micro, 2 epochs | micro, 6 epochs |
+|---|---|---|---|---|---|
+| Ordinary (lowercase) words that occur in the books | 93.3% | 92.6% | 97.2% | 96.9% | 98.3% |
+| All words, names included | 90.1% | 84.8% | 90.6% | 93.7% | 96.1% |
 
-A misspelled or invented ordinary word went from about one in 15 to one in 33. The new
-models also invent names that sound Mongolian (*Данзанжавын*, *Лувсанжавын*), which is why
-the second row is lower. The longest passage copied word for word from the books was 2 to 4
-words for every model: they write new text, they do not recite. The meaning still drifts
-within a sentence; "Тэр өдөр" continued by `micro`:
+A misspelled or invented ordinary word went from about one in 15 (the first model) to one in
+33 (`micro`, 2 epochs) and one in 60 (`micro`, 6 epochs). The new models also invent names
+that sound Mongolian (*Данзанжавын*, *Лувсанжавын*), which is why the second row is lower.
+The longest passage copied word for word from the books was 2 to 4 words for every model,
+6 epochs included: they write new text, they do not recite. The meaning still drifts within
+a sentence; "Тэр өдөр" continued by `micro` after 6 epochs (seed 0):
 
-> Тэр өдөр Богд Чингис хаан, Хөвүүд, Өглөөний зочид буудалд хүрч очоод тэр, түүний хөлөг,
-> зочдын гарт нэхэж ирэхэд нь Мэргидийн бэйсийн хошууны үед Чингис хаанд явуулсан гэдэг.
+> Тэр өдөр «Сайн сайхан сайхан охин» гэсэн үгсийг энэ мэтээр ойлгосон билээ. Шекспирийг
+> тэвчсэний дээр «Карнатик» хэмээх жүжгийн зохиолын талаар Шекспирийн жүжиг бичсэн нь:
+> «VII Ричард» хэмээх жүжигт...
 
-Not measured on the books yet: more epochs for `micro`, dropout 0 for `micro`, a longer
-context (256 tokens), a larger vocabulary (4,096 or 8,192) and the `small` preset (it needs
-a GPU).
+Not measured on the books yet: more than 6 epochs, dropout 0 for `micro`, a longer context
+(256 tokens), a larger vocabulary (4,096 or 8,192) and the `small` preset (it needs a GPU).
 
 The better path, when you have public Mongolian text as well (see the measurements below):
 
@@ -162,7 +167,7 @@ What this means in practice:
 
 - **About 1 MB (one book).** The model writes text that looks like Mongolian for a few words
   at a time and then drifts. With the memory it can recite its corpus. It cannot reason about it.
-- **About 20 MB (the 46 books).** Real words with the right suffixes (97% of its ordinary
+- **About 20 MB (the 46 books).** Real words with the right suffixes (98% of its ordinary
   words occur in the books), grammatical phrases of a few words, invented names that sound
   Mongolian. The meaning still drifts within a sentence. See
   [Training on the books](#training-on-the-books).
@@ -592,7 +597,7 @@ hidden states the model learned, not hand-made codes.
 - [x] `model.py`: architecture, size presets, optional depth sharing, KV-cache generation
 - [x] `tokenizer.py`: byte-level BPE with the chat tokens reserved
 - [x] `prepare.py`: books (.epub, .txt) to clean text, with a quality report
-- [x] Trained on the 46 books: `micro`, 1.078 bits per byte on six unseen books (the first model: 1.320)
+- [x] Trained on the 46 books: `micro`, 6 epochs, 1.018 bits per byte on six unseen books (the first model: 1.320)
 - [x] `train.py`: small-corpus recipe, validated by experiments; `--init`, pause and resume
 - [x] `memory.py`: voting and recall, tuned on held-out text
 - [x] `persona.py`: chat format, SFT / DPO / ORPO losses, trait measurements

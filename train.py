@@ -3,7 +3,7 @@ train.py — train MongolHistorySLM on a small text corpus
 ========================================================
 
     python train.py --data data/books.txt                     # the nano preset trains on a CPU
-    python train.py --data data/clean --preset micro --dropout 0.1 --epochs 2 --threads 8   # 18.9 MB of books: ~1 h on a CPU
+    python train.py --data data/clean --preset micro --dropout 0.1 --epochs 6 --threads 8   # 18.9 MB of books: ~2.5 h on a CPU
     python train.py --data data/ --preset micro --batch 32 --context 256   # a folder of .txt files; use a GPU
     python train.py --data data/books.txt --resume            # continue an interrupted run
     python train.py --data data/books.txt --init public/model.pt --lr 5e-4   # continue a trained model on new text
