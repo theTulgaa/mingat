@@ -365,9 +365,9 @@ sample from its first pages alone pointed the wrong way here.
 ### On a GPU
 
 `train.py` picks the GPU when there is one and uses 16-bit autocast (bf16 on A100/L4, fp16
-with `GradScaler` on T4/P100). This machine has no GPU, so that path has not run here; the smoke
-check of `sweep.py` ([Training on a Colab GPU](#training-on-a-colab-gpu)) is its first test.
-Sessions with a time limit can pause and continue:
+with `GradScaler` on T4/P100). On November 16 the smoke check of `sweep.py`
+([Training on a Colab GPU](#training-on-a-colab-gpu)) ran that path on a T4 for the first time,
+pause and resume included. Sessions with a time limit can pause and continue:
 
 ```bash
 python train.py --data data/ --preset micro --batch 32 --context 256 --stop-after 5000
@@ -375,7 +375,7 @@ python train.py --data data/ --preset micro --batch 32 --context 256 --resume
 ```
 
 A paused and resumed run reproduces an unbroken run exactly on a CPU (`tests.py` checks it).
-Three changes for the GPU (November 16):
+Changes for the GPU (November 16), measured on a Colab T4:
 
 - **Resuming works on a GPU.** The checkpoint used to be loaded straight onto the GPU, the
   random-number states included, and `torch.set_rng_state` takes only a CPU tensor ("RNG state
@@ -384,14 +384,27 @@ Three changes for the GPU (November 16):
 - **Fewer, safer checkpoint writes.** A checkpoint of `small` is about 400 MB. `--ckpt-minutes 10`
   writes it at most every 10 minutes instead of at every check. It goes to a temporary file
   first and is then renamed, so a run killed mid-write keeps the previous checkpoint.
-- **Fewer GPU operations per step.** For a model this small, a GPU step's time depends more on
-  how many operations Python issues, one kernel launch each, than on the arithmetic. Counted in
-  one training step of `small`: forward and backward 2,132 operations, Muon 2,354 (about 49 per
-  matrix, one matrix at a time), weight averaging 98. On a GPU, Muon now orthogonalizes all
-  matrices of one shape as a single stack (464 operations; the result matches to 3e-8), and the
-  averaging is one `_foreach_lerp_` call. On a CPU the stack was slower (0.94 s against 0.74 s
-  per Muon step of `small`), so a CPU still takes one matrix at a time, and CPU training gives
-  the same numbers, bit for bit, as before. The smoke check times both ways on the GPU.
+- **A faster Muon step on the GPU.** On a T4, Muon took about half of every training step of
+  `small` (62–67 ms of about 128 ms). Two changes, on the GPU only:
+  - The matrices of one shape are orthogonalized as one stack. A training step of `small` has
+    2,132 operations in its forward and backward pass and had 2,354 in Muon (about 49 per
+    matrix); stacked, Muon has 464. I expected that to matter a lot, since each operation is
+    a kernel launch. Measured, it saved only 8% (67.3 → 61.6 ms per Muon step): the float32
+    arithmetic, not the launches, was the cost. The result matches to 3e-8.
+  - The products run in float16, on the GPU's half-precision units: 56.3 → 17.8 ms for the 48
+    matrices, with directions that agree with float32 to a cosine of 0.999994. Trained side by
+    side on the T4 for 1,500 steps (same seed, same batches), float16 ended 0.002 nats higher on
+    validation (3.9268 against 3.9245) and on the test books (4.1745 against 4.1723), below the
+    0.01 this README treats as noise, and ran 1.4 times as fast (11.4k against 8.2k tokens/s,
+    the two runs sharing the GPU). `--muon-fp32` switches back.
+
+  On a CPU nothing changed: one matrix at a time (stacking was slower there, 0.94 s against
+  0.74 s per Muon step of `small`) in float32, and CPU training gives the same numbers, bit for
+  bit, as before. The weight average is one `_foreach_lerp_` call on both.
+- **The same validation text on every system.** The books of a folder were read in the order of
+  their paths, which Windows sorts ignoring case and Linux does not, so the two put different
+  passages into the validation slices (7,283,817 against 7,286,542 training tokens). They are
+  now read in name order on both; the test books were in the same order either way.
 
 ## Memory
 

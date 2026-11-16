@@ -53,9 +53,13 @@ from tokenizer import SPECIAL_RE, BPETokenizer
 # Data
 # ----------------------------------------------------------------------------------------
 def read_text(path: Path) -> str:
-    """A text file, or a folder of .txt files joined with the document separator."""
+    """A text file, or a folder of .txt files joined with the document separator.
+
+    The files go in the order of their names, compared letter by letter with capitals first
+    on every system. (Sorting the paths themselves ignores case on Windows but not on Linux,
+    and the different order put different passages into the validation slices.)"""
     if path.is_dir():
-        files = sorted(path.glob("*.txt"))
+        files = sorted(path.glob("*.txt"), key=lambda p: p.name)
         if not files:
             sys.exit(f"no .txt files in {path}")
         return "\n<|endoftext|>\n".join(f.read_text(encoding="utf-8-sig") for f in files)
@@ -173,7 +177,7 @@ class EMA:
                     p.copy_(b)
 
 
-def newton_schulz(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
+def newton_schulz(g: torch.Tensor, steps: int = 5, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Approximately the nearest orthogonal matrix to g (U V^T from its SVD), using only
     matrix products. Each step applies the odd polynomial a*s + b*s^3 + c*s^5 to every
     singular value s, which pushes it toward 1 (Jordan et al., 2024). After 5 steps the
@@ -181,9 +185,11 @@ def newton_schulz(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
     Ones that started below roughly 1/500 of the matrix norm are only partly raised.
 
     g is one matrix (rows, cols) or a stack of same-shape matrices (n, rows, cols); each
-    matrix of a stack is treated on its own, exactly as if it came alone."""
+    matrix of a stack is treated on its own, exactly as if it came alone. `dtype` is the
+    precision of the products. float16 is safe here: after the scaling below every entry is
+    at most 1, and the result is only a direction, which needs no more than a few digits."""
     a, b, c = 3.4445, -4.7750, 2.0315
-    x = g.float()
+    x = g.to(dtype)
     tall = x.size(-2) > x.size(-1)
     if tall:                                  # work on the wide orientation: x @ x.T is smaller
         x = x.mT
@@ -203,17 +209,24 @@ class Muon(torch.optim.Optimizer):
     barely touches. The step is then scaled by sqrt(rows / columns) for tall matrices and
     applied with decoupled weight decay, as in AdamW.
 
-    On a GPU, the matrices of one shape (every layer's qkv_proj, every layer's down_proj...)
-    are orthogonalized together, as one stack. The result is the same to about 1e-7, and a
-    step of `small` issues 464 GPU operations instead of 2,354 (each one costs a kernel
-    launch, and for models this small the launches, not the arithmetic, set the speed). On a
-    CPU the stacked products were slower (0.94 s against 0.74 s per step of `small`), so
-    there each matrix goes alone. `batched` overrides the choice."""
+    On a GPU, two things make the step faster without changing what it computes:
+    - The matrices of one shape (every layer's qkv_proj, every layer's down_proj...) are
+      orthogonalized together, as one stack: 464 GPU operations per step of `small` instead
+      of 2,354. The result is the same to about 1e-7. On a T4 that took a Muon step of
+      `small` from 67.3 to 61.6 ms; on a CPU the stacked products were slower (0.94 s
+      against 0.74 s), so a CPU takes the matrices one at a time.
+    - The orthogonalization runs in float16, on the GPU's half-precision units: 17.8 ms
+      instead of 56.3 ms for the 48 matrices of `small` on a T4, with directions that agree
+      with the float32 ones to a cosine of 0.999994. Trained side by side for 1,500 steps
+      (same seed), float16 ended 0.002 nats higher on validation and on the test books, below
+      the noise between seeds, and ran 1.4 times as fast. A CPU stays in float32.
+    `batched` and `ns_dtype` override the choices."""
 
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0,
-                 batched: Optional[bool] = None):
+                 batched: Optional[bool] = None, ns_dtype: Optional[torch.dtype] = None):
         super().__init__(params, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
         self.batched = batched                # None: stacked on a GPU, one at a time on a CPU
+        self.ns_dtype = ns_dtype              # None: float16 on a GPU, float32 on a CPU
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -230,11 +243,13 @@ class Muon(torch.optim.Optimizer):
             for i, p in enumerate(params):
                 same_shape.setdefault(p.shape, []).append(i)
             for idx in same_shape.values():
-                stacked = self.batched if self.batched is not None else params[idx[0]].is_cuda
+                on_gpu = params[idx[0]].is_cuda
+                stacked = self.batched if self.batched is not None else on_gpu
+                dtype = self.ns_dtype or (torch.float16 if on_gpu else torch.float32)
                 if stacked:
-                    directions = newton_schulz(torch.stack([updates[i] for i in idx])).unbind(0)
+                    directions = newton_schulz(torch.stack([updates[i] for i in idx]), dtype=dtype).unbind(0)
                 else:
-                    directions = [newton_schulz(updates[i]) for i in idx]
+                    directions = [newton_schulz(updates[i], dtype=dtype) for i in idx]
                 for i, d in zip(idx, directions):
                     p = params[i]
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -257,7 +272,8 @@ def make_optimizers(model: MongolHistorySLM, args) -> List[torch.optim.Optimizer
             [{"params": [p for p in rest if p.dim() >= 2], "weight_decay": args.weight_decay},
              {"params": [p for p in rest if p.dim() < 2], "weight_decay": 0.0}],
             lr=args.lr, betas=(0.9, 0.95))
-        opts = [Muon(matrices, lr=MUON_LR_RATIO * args.lr, weight_decay=args.weight_decay), adam]
+        opts = [Muon(matrices, lr=MUON_LR_RATIO * args.lr, weight_decay=args.weight_decay,
+                     ns_dtype=torch.float32 if args.muon_fp32 else None), adam]
     for opt in opts:
         for group in opt.param_groups:
             group["peak_lr"] = group["lr"]
@@ -290,6 +306,8 @@ def parse_args(argv=None):
                     help="0.2 for about 1 MB, 0.1 for about 20 MB (both measured); 0 for one pass over a large corpus")
     ap.add_argument("--ema", type=float, default=0.999, help="weight-averaging decay (0 = off)")
     ap.add_argument("--optimizer", default="muon", choices=["muon", "adamw"])
+    ap.add_argument("--muon-fp32", action="store_true",
+                    help="orthogonalize in float32 on a GPU too (slower; a CPU always does)")
     ap.add_argument("--unique-layers", type=int, help="distinct blocks: fewer parameters, slightly higher loss")
     ap.add_argument("--d-model", type=int, help="override the preset width (the head count stays; head_dim scales)")
     ap.add_argument("--n-layers", type=int, help="override the preset depth")

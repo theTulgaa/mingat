@@ -80,9 +80,16 @@ def test_muon() -> None:
             opt.step()
     gap = max((p - q).abs().max().item() for p, q in zip(*nets))
     assert gap < 1e-6, gap
+
+    # The GPU's half precision gives the same directions, returned in the input's precision.
+    g = torch.randn(3, 384, 640) * 1e-3
+    full, half = train.newton_schulz(g), train.newton_schulz(g, dtype=torch.float16)
+    agree = ((full * half).sum((-2, -1)) / (full.norm(dim=(-2, -1)) * half.norm(dim=(-2, -1)))).min().item()
+    assert half.dtype == torch.float32 and agree > 0.9999, agree
     print(f"[ok] Muon: Newton-Schulz output has singular values in [{low:.2f}, {high:.2f}] and cosine "
           f"{cosine:.3f} to the exact orthogonal factor; the step size ignores the gradient's scale; "
-          f"stacked same-shape matrices (the GPU path) match one at a time to {gap:.0e}")
+          f"stacked same-shape matrices (the GPU path) match one at a time to {gap:.0e}; "
+          f"float16 directions agree with float32 to a cosine of {agree:.5f}")
 
 
 def test_schedule_and_ema() -> None:
