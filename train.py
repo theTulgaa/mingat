@@ -36,6 +36,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -154,8 +155,8 @@ class EMA:
     def update(self, model: torch.nn.Module) -> None:
         self.updates += 1
         decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
-        for s, p in zip(self.shadow, model.parameters()):
-            s.lerp_(p.detach(), 1 - decay)
+        # shadow.lerp_(p, 1 - decay) for every tensor, as one call (one GPU launch, not ~100)
+        torch._foreach_lerp_(self.shadow, [p.detach() for p in model.parameters()], 1 - decay)
 
     @contextlib.contextmanager
     def applied(self, model: torch.nn.Module):
@@ -177,17 +178,20 @@ def newton_schulz(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
     matrix products. Each step applies the odd polynomial a*s + b*s^3 + c*s^5 to every
     singular value s, which pushes it toward 1 (Jordan et al., 2024). After 5 steps the
     singular values lie between about 0.7 and 1.2, close enough for an update direction.
-    Ones that started below roughly 1/500 of the matrix norm are only partly raised."""
+    Ones that started below roughly 1/500 of the matrix norm are only partly raised.
+
+    g is one matrix (rows, cols) or a stack of same-shape matrices (n, rows, cols); each
+    matrix of a stack is treated on its own, exactly as if it came alone."""
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.float()
-    tall = x.size(0) > x.size(1)
+    tall = x.size(-2) > x.size(-1)
     if tall:                                  # work on the wide orientation: x @ x.T is smaller
-        x = x.T
-    x = x / (x.norm() + 1e-7)                 # Frobenius norm 1, so every singular value is <= 1
+        x = x.mT
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)   # Frobenius norm 1, so every singular value is <= 1
     for _ in range(steps):
-        s = x @ x.T
+        s = x @ x.mT
         x = a * x + (b * s + c * s @ s) @ x
-    return (x.T if tall else x).to(g.dtype)
+    return (x.mT if tall else x).to(g.dtype)
 
 
 class Muon(torch.optim.Optimizer):
@@ -197,25 +201,44 @@ class Muon(torch.optim.Optimizer):
     momentum of the gradient and replaces it by the nearest orthogonal matrix, so the update
     has the same size in every direction of the matrix, including directions the gradient
     barely touches. The step is then scaled by sqrt(rows / columns) for tall matrices and
-    applied with decoupled weight decay, as in AdamW."""
+    applied with decoupled weight decay, as in AdamW.
 
-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0):
+    On a GPU, the matrices of one shape (every layer's qkv_proj, every layer's down_proj...)
+    are orthogonalized together, as one stack. The result is the same to about 1e-7, and a
+    step of `small` issues 464 GPU operations instead of 2,354 (each one costs a kernel
+    launch, and for models this small the launches, not the arithmetic, set the speed). On a
+    CPU the stacked products were slower (0.94 s against 0.74 s per step of `small`), so
+    there each matrix goes alone. `batched` overrides the choice."""
+
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0,
+                 batched: Optional[bool] = None):
         super().__init__(params, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
+        self.batched = batched                # None: stacked on a GPU, one at a time on a CPU
 
     @torch.no_grad()
     def step(self, closure=None):
         for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
+            params = [p for p in group["params"] if p.grad is not None]
+            updates = []
+            for p in params:
                 state = self.state[p]
                 if "momentum" not in state:
                     state["momentum"] = torch.zeros_like(p)
                 m = state["momentum"].lerp_(p.grad, 1 - group["momentum"])
-                update = newton_schulz(p.grad.lerp(m, group["momentum"]))        # Nesterov momentum
-                update = update * max(1.0, p.size(0) / p.size(1)) ** 0.5
-                p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(update, alpha=-group["lr"])
+                updates.append(p.grad.lerp(m, group["momentum"]))               # Nesterov momentum
+            same_shape: dict = {}
+            for i, p in enumerate(params):
+                same_shape.setdefault(p.shape, []).append(i)
+            for idx in same_shape.values():
+                stacked = self.batched if self.batched is not None else params[idx[0]].is_cuda
+                if stacked:
+                    directions = newton_schulz(torch.stack([updates[i] for i in idx])).unbind(0)
+                else:
+                    directions = [newton_schulz(updates[i]) for i in idx]
+                for i, d in zip(idx, directions):
+                    p = params[i]
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(d * max(1.0, p.size(0) / p.size(1)) ** 0.5, alpha=-group["lr"])
 
 
 MUON_LR_RATIO = 10.0     # Muon's matrices step at 10 x --lr: 0.02 at the default 2e-3, the values tested
@@ -280,6 +303,9 @@ def parse_args(argv=None):
     ap.add_argument("--stop-after", type=int, default=0,
                     help="pause after this many steps in this session (e.g. before a Colab limit); continue with --resume")
     ap.add_argument("--no-ckpt", action="store_true", help="do not write out/ckpt.pt (experiments)")
+    ap.add_argument("--ckpt-minutes", type=float, default=0.0,
+                    help="write out/ckpt.pt at most every this many minutes (0 = at every check). A checkpoint "
+                         "of `small` is about 400 MB: on Google Drive use 10, so a disconnect costs at most 10 minutes")
     ap.add_argument("--sample", default="Монгол", help="prompt for the sample printed at the end")
     return ap.parse_args(argv)
 
@@ -357,13 +383,18 @@ def main(argv=None) -> dict:
     running, seen = 0.0, 0                          # sum and count of training losses since the last check
     ckpt_path = args.out / "ckpt.pt"
     if args.resume and ckpt_path.exists():
-        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # Loaded onto the CPU: the random-number states must stay CPU tensors (set_rng_state
+        # rejects a GPU copy). The weights and averages are moved to the model's device below;
+        # load_state_dict moves the optimizer states to their parameters' device itself.
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
         for opt, state in zip(opts, ck["opts"]):
             opt.load_state_dict(state)
         if ema is not None:
-            ema.shadow, ema.updates = ck["ema"], ck["ema_updates"]
-        step, best, history = ck["step"], ck["best"], ck["history"]
+            ema.shadow, ema.updates = [s.to(device) for s in ck["ema"]], ck["ema_updates"]
+        step, history = ck["step"], ck["history"]
+        best = {kind: (loss, at, None if weights is None else [w.to(device) for w in weights])
+                for kind, (loss, at, weights) in ck["best"].items()}
         running, seen = ck["running"], ck["seen"]
         gen.set_state(ck["gen"])                    # the data order continues where it stopped
         torch.set_rng_state(ck["rng"])              # and so do the dropout masks
@@ -371,16 +402,28 @@ def main(argv=None) -> dict:
             torch.cuda.set_rng_state_all(ck["cuda_rng"])
         scaler.load_state_dict(ck["scaler"])
         print(f"resumed from step {step}")
+    last_save = time.perf_counter()
 
-    def save_ckpt(step_now: int, running_loss: float, running_count: int) -> None:
-        """Everything a resume needs to continue as if the run had never stopped."""
-        if not args.no_ckpt:
-            torch.save({"model": model.state_dict(), "opts": [o.state_dict() for o in opts],
-                        "ema": ema.shadow if ema else None, "ema_updates": ema.updates if ema else 0,
-                        "running": running_loss, "seen": running_count,
-                        "step": step_now, "best": best, "history": history, "gen": gen.get_state(),
-                        "rng": torch.get_rng_state(), "scaler": scaler.state_dict(),
-                        "cuda_rng": torch.cuda.get_rng_state_all() if on_gpu else None}, ckpt_path)
+    def save_ckpt(step_now: int, running_loss: float, running_count: int, force: bool = False) -> None:
+        """Everything a resume needs to continue as if the run had never stopped. With
+        --ckpt-minutes, a check writes it only when that much time has passed since the last
+        write; a pause always writes it."""
+        nonlocal last_save
+        if args.no_ckpt or (not force and time.perf_counter() - last_save < 60 * args.ckpt_minutes):
+            return
+        tmp = ckpt_path.with_name(ckpt_path.name + ".tmp")
+        torch.save({"model": model.state_dict(), "opts": [o.state_dict() for o in opts],
+                    "ema": ema.shadow if ema else None, "ema_updates": ema.updates if ema else 0,
+                    "running": running_loss, "seen": running_count,
+                    "step": step_now, "best": best, "history": history, "gen": gen.get_state(),
+                    "rng": torch.get_rng_state(), "scaler": scaler.state_dict(),
+                    "cuda_rng": torch.cuda.get_rng_state_all() if on_gpu else None}, tmp)
+        try:
+            os.replace(tmp, ckpt_path)              # a run killed mid-write leaves the previous checkpoint intact
+        except OSError:                             # a file system that cannot rename over an existing file
+            ckpt_path.unlink(missing_ok=True)
+            os.replace(tmp, ckpt_path)
+        last_save = time.perf_counter()
 
     def check(step_now: int, train_loss: Optional[float], elapsed: float) -> bool:
         """Validate the current and the averaged weights; remember the best of each.
@@ -440,7 +483,7 @@ def main(argv=None) -> dict:
                 print(f"stopping: no new best for {args.patience} checks")
                 break
         if args.stop_after and step - start_step >= args.stop_after and step < steps:
-            save_ckpt(step, running, seen)
+            save_ckpt(step, running, seen, force=True)
             print(f"paused at step {step}; run the same command with --resume to continue")
             return {"paused_at": step}
     seconds = time.perf_counter() - t0

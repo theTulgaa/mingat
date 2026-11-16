@@ -10,6 +10,8 @@ and confident.
 | `tokenizer.py` | Byte-level BPE tokenizer |
 | `prepare.py` | Turns books (.epub, .txt) into clean training text, with a report |
 | `train.py` | Training recipe for a small corpus |
+| `sweep.py` | Trains several settings one after another, survives interruptions, compares them on the test books |
+| `train_colab.ipynb` | Runs `sweep.py` on a free Colab GPU, with the books from your Google Drive |
 | `generate.py` | Write with a trained model: type the start of a text, it continues |
 | `memory.py` | A memory of the corpus, searched while the model writes |
 | `persona.py` | Chat format, losses and measurements for the character |
@@ -24,14 +26,16 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu   # on a GPU 
 pip install numpy openpyxl
 
 python tests.py                                      # every check, about a minute
-python prepare.py                                    # books in data/novels/ -> clean text in data/clean/
-python train.py --data data/clean --preset micro --dropout 0.1 --epochs 6 --threads 8   # about 2.5 h -> out/model.pt
+python prepare.py --zip data/mingat_books.zip        # books in data/novels/ -> data/clean/ (training) and data/test/
+python train.py --data data/clean --test data/test --preset micro --dropout 0.1 --epochs 6 --threads 8   # ~6 h on a CPU
 python generate.py --model out/model.pt              # type the start of a text; the model continues it
 python memory.py --model out/model.pt --data data/clean --ask "Чингис хаан"
 ```
 
 `--data` is a UTF-8 `.txt` file or a folder of them. `data/` and `out/` are gitignored, so your
-corpus stays on your machine.
+corpus stays on your machine. The 6-hour estimate is for the 42 MB of books of November 16; on a
+free Colab GPU, `train_colab.ipynb` trains bigger models in less time (see
+[Training on a Colab GPU](#training-on-a-colab-gpu)).
 
 ### Preparing the books
 
@@ -53,20 +57,36 @@ numerals typed with Cyrillic letters (`ХIХ`) and Greek θ for ө. The report l
 size before and after, the share of Ө/Ү among the letters (5-7% in Mongolian, none in Russian)
 and of Latin letters, what was removed, and warnings for anything that looks wrong.
 
-On the 47 e-nom.mn books of November 2026 it kept 46 books, 18.9 MB and 1.59M words. It removed
-209,000 characters, about 1% of the text: footnotes 122k, colophons 40k, library text 27k and
-foreign lines 20k, and it repaired 153 words. The skipped book is *Чингисийн есөн өрлөгтэй өнчин
-хөвүүн*, 85% of which is in *Өнчин хүүгийн шастирын тухай*.
+On the 47 e-nom.mn books of November 13, 2026 it kept 46 books, 18.9 MB and 1.59M words. It
+removed 209,000 characters, about 1% of the text: footnotes 122k, colophons 40k, library text 27k
+and foreign lines 20k, and it repaired 153 words. The skipped book is *Чингисийн есөн өрлөгтэй
+өнчин хөвүүн*, 85% of which is in *Өнчин хүүгийн шастирын тухай*.
+
+On November 16 there were 111 books (64 new). It kept 109: 42.0 MB and 3.55M words, with no
+warnings. It removed 646,000 characters (footnotes 437k, colophons 81k, library text 65k, foreign
+lines 63k; a third of the footnotes came from one book, Rubruck's travel account) and repaired 309 words. The
+second skipped book is *Шартрын сүм*, 59% of whose passages are in *Хоригдол эр буцаж ирсэн нь*, a
+collection by the same author.
+
+Six books are the **test set**, listed in `TEST_BOOKS` in `prepare.py`: they go to `data/test/`,
+not `data/clean/`, so no model trains on them and every model's score on them can be compared
+with every other's (see the next section). The report checks that they stay unseen: the share of
+each test book's 8-word passages that occur in a training book. A test book is never skipped as a
+duplicate; a training book holding its text shows up there instead. On November 16 every share
+was 0.00%. `--zip data/mingat_books.zip` also packs both folders into one file (10.8 MB) to upload
+to Google Drive for `train_colab.ipynb`.
 
 ### Training on the books
 
 ```bash
-python train.py --data data/clean --preset micro --dropout 0.1 --epochs 6 --threads 8
+python train.py --data data/clean --test data/test --preset micro --dropout 0.1 --epochs 6 --threads 8
 ```
 
-This trains a tokenizer and the model on the 46 books in about two and a half hours on a
-20-thread desktop CPU. `--threads 8` is the fastest setting for one run there: `micro` is about 10% slower with
-16 threads and 20% slower with 4.
+This trains a tokenizer and the model on the training books and scores it on the test books at
+the end. On the 40 training books of November 13 (18 MB) that took two and a half hours on a
+20-thread desktop CPU; on the 103 of November 16 (41 MB) it would take about six, so those go to
+a GPU (next section). `--threads 8` is the fastest setting for one run on that CPU: `micro` is
+about 10% slower with 16 threads and 20% slower with 4.
 
 The settings were measured. Six whole books (0.65 MB) were set aside as a test: *Бөхийн тухай
 домгууд*, *Синдбад далайчин*, *Гайхамшгийн нэвтэрхий толь – 2*, *Цэцэн бэр* and two short
@@ -133,6 +153,35 @@ python train.py --data public/ --out out_public --dropout 0.1 --epochs 2        
 python train.py --data data/books.txt --init out_public/model.pt --lr 2e-4 --epochs 10  # 2. your corpus
 python memory.py --model out/model.pt --data data/books.txt                            # 3. its memory
 ```
+
+### Training on a Colab GPU
+
+The 103 training books of November 16 are 41.4 MB, 7.28M tokens: 2.3 times the text of the table
+above. Six passes would take about six hours on the CPU with `micro` (2,086 tokens/s) and twelve
+with `small` (19.7M parameters, about 1,000 tokens/s). A free Colab GPU runs them instead:
+
+1. `python prepare.py --zip data/mingat_books.zip`, then upload the zip to Google Drive so that it
+   is at `My Drive/mingat/mingat_books.zip`. The books stay in your Drive; GitHub never sees them.
+2. Open [`train_colab.ipynb` in Colab](https://colab.research.google.com/github/theTulgaa/mingat/blob/main/train_colab.ipynb),
+   choose a T4 GPU (Runtime → Change runtime type) and Run all.
+3. Download `My Drive/mingat/runs` and unzip it into `out/`.
+
+The notebook runs `sweep.py`. First a smoke check: 300 steps of `small` on the real books, paused
+halfway and resumed. It goes through everything the long runs use on that GPU (16-bit training,
+the checkpoint, the resume, the final scores, the sample), measures the speed and estimates the
+total time. Then three runs, each scored on the same six test books as the table above:
+
+| Run | Question |
+|---|---|
+| `micro`, dropout 0.1, 6 passes | The recipe of the 1.018 model on 2.3× the books: what do the new books alone give? |
+| `small`, dropout 0.1, 6 passes | Does 3× the parameters help, at the same number of passes? |
+| `small`, dropout 0.1, up to 12 passes | Do more passes help it? It stops after 4,000 steps without a better validation loss. |
+
+The three share one tokenizer and keep the rest of the CPU recipe (batches of 16 × 128 tokens,
+Muon, weight averaging), so the differences come from the books, the size and the passes. A
+disconnect costs at most 10 minutes: each run writes its checkpoint to the Drive every 10 minutes
+(`--ckpt-minutes 10`), and running the notebook again skips the finished runs and continues the
+interrupted one.
 
 ## What a small private corpus can give
 
@@ -316,8 +365,9 @@ sample from its first pages alone pointed the wrong way here.
 ### On a GPU
 
 `train.py` picks the GPU when there is one and uses 16-bit autocast (bf16 on A100/L4, fp16
-with `GradScaler` on T4/P100). I could not run that path here: this machine has no GPU. Treat
-the first GPU run as a test. Sessions with a time limit can pause and continue:
+with `GradScaler` on T4/P100). This machine has no GPU, so that path has not run here; the smoke
+check of `sweep.py` ([Training on a Colab GPU](#training-on-a-colab-gpu)) is its first test.
+Sessions with a time limit can pause and continue:
 
 ```bash
 python train.py --data data/ --preset micro --batch 32 --context 256 --stop-after 5000
@@ -325,6 +375,23 @@ python train.py --data data/ --preset micro --batch 32 --context 256 --resume
 ```
 
 A paused and resumed run reproduces an unbroken run exactly on a CPU (`tests.py` checks it).
+Three changes for the GPU (November 16):
+
+- **Resuming works on a GPU.** The checkpoint used to be loaded straight onto the GPU, the
+  random-number states included, and `torch.set_rng_state` takes only a CPU tensor ("RNG state
+  must be a torch.ByteTensor"). Every resume after a Colab disconnect would have failed. The
+  checkpoint is now loaded onto the CPU, and the weights are moved to the GPU.
+- **Fewer, safer checkpoint writes.** A checkpoint of `small` is about 400 MB. `--ckpt-minutes 10`
+  writes it at most every 10 minutes instead of at every check. It goes to a temporary file
+  first and is then renamed, so a run killed mid-write keeps the previous checkpoint.
+- **Fewer GPU operations per step.** For a model this small, a GPU step's time depends more on
+  how many operations Python issues, one kernel launch each, than on the arithmetic. Counted in
+  one training step of `small`: forward and backward 2,132 operations, Muon 2,354 (about 49 per
+  matrix, one matrix at a time), weight averaging 98. On a GPU, Muon now orthogonalizes all
+  matrices of one shape as a single stack (464 operations; the result matches to 3e-8), and the
+  averaging is one `_foreach_lerp_` call. On a CPU the stack was slower (0.94 s against 0.74 s
+  per Muon step of `small`), so a CPU still takes one matrix at a time, and CPU training gives
+  the same numbers, bit for bit, as before. The smoke check times both ways on the GPU.
 
 ## Memory
 
@@ -647,6 +714,8 @@ learned from text: more books, more passes, a bigger model.
 - [x] `prepare.py`: books (.epub, .txt) to clean text, with a quality report
 - [x] Trained on the 46 books: `micro`, 6 epochs, 1.018 bits per byte on six unseen books (the first model: 1.320)
 - [x] `train.py`: small-corpus recipe, validated by experiments; `--init`, pause and resume
+- [x] `sweep.py` and `train_colab.ipynb`: training on a free Colab GPU that survives disconnects; the six test books fixed in `prepare.py`
+- [ ] The GPU runs on the 103 books of November 16 (`micro` and `small`), scored on the six test books
 - [x] `memory.py`: voting and recall, tuned on held-out text
 - [x] `persona.py`: chat format, SFT / DPO / ORPO losses, trait measurements
 - [x] `program_qa.py`: weight-space programming experiment

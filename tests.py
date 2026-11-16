@@ -60,8 +60,29 @@ def test_muon() -> None:
         opt.step()
         size = torch.linalg.matrix_norm(w.detach(), ord=2).item()
         assert 0.6 * 0.02 < size < 1.25 * 0.02, size
+
+    # The GPU path: a stack of same-shape matrices gives each matrix's own result, and a Muon
+    # step on stacks moves the weights as the one-at-a-time step does.
+    for shape in ((5, 96, 32), (3, 32, 96)):
+        g = torch.randn(shape)
+        stacked, alone = train.newton_schulz(g), torch.stack([train.newton_schulz(m) for m in g])
+        assert torch.allclose(stacked, alone, atol=1e-6), (stacked - alone).abs().max()
+    shapes = [(96, 32), (32, 96), (96, 32), (64, 64), (32, 96), (96, 32)]
+    nets = [[torch.nn.Parameter(torch.randn(s) * 0.02) for s in shapes] for _ in range(2)]
+    for p, q in zip(*nets):
+        q.data.copy_(p.data)
+    opts = [train.Muon(nets[0], weight_decay=0.1, batched=False), train.Muon(nets[1], weight_decay=0.1, batched=True)]
+    for _ in range(3):
+        for p, q in zip(*nets):
+            p.grad = torch.randn(p.shape)
+            q.grad = p.grad.clone()
+        for opt in opts:
+            opt.step()
+    gap = max((p - q).abs().max().item() for p, q in zip(*nets))
+    assert gap < 1e-6, gap
     print(f"[ok] Muon: Newton-Schulz output has singular values in [{low:.2f}, {high:.2f}] and cosine "
-          f"{cosine:.3f} to the exact orthogonal factor; the step size ignores the gradient's scale")
+          f"{cosine:.3f} to the exact orthogonal factor; the step size ignores the gradient's scale; "
+          f"stacked same-shape matrices (the GPU path) match one at a time to {gap:.0e}")
 
 
 def test_schedule_and_ema() -> None:
@@ -166,8 +187,38 @@ def test_prepare() -> None:
     assert "notes" not in books
     assert prepare.fix_word("Тomus") == "Tomus" and prepare.fix_word("mанхимын") == "танхимын"
     assert prepare.fix_word("Шpu") == "Шpu"                                   # undecidable: left as it is
+
+    # Test books go to their own folder, and a training book holding a third of a test book's
+    # text is reported. The zip has both folders.
+    rng = torch.Generator().manual_seed(0)
+    syllables = ["ба", "гө", "дү", "жа", "лө", "мү", "на", "рө", "сү", "та", "хө", "цү"]
+    word = lambda: "".join(syllables[i] for i in torch.randint(0, len(syllables), (3,), generator=rng).tolist())
+    sentence = lambda: " ".join(word() for _ in range(10)).capitalize() + "."
+    test_text = [sentence() for _ in range(300)]
+    texts = {"a": test_text, "b": [sentence() for _ in range(300)], "c": test_text[:100] + [sentence() for _ in range(300)]}
+    keep = prepare.TEST_BOOKS
+    prepare.TEST_BOOKS = ("a",)
+    try:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            tmp = Path(tmp)
+            (tmp / "src").mkdir()
+            for name, lines in texts.items():
+                (tmp / "src" / f"{name}.txt").write_text("\n".join(lines), encoding="utf-8")
+            (tmp / "out").mkdir()
+            (tmp / "out" / "a.txt").write_text("from an older run", encoding="utf-8")
+            split = prepare.main(["--src", str(tmp / "src"), "--out", str(tmp / "out"), "--test-out", str(tmp / "test"),
+                                  "--zip", str(tmp / "books.zip")])
+            assert sorted(p.name for p in (tmp / "out").iterdir()) == ["b.txt", "c.txt"]
+            assert sorted(p.name for p in (tmp / "test").iterdir()) == ["a.txt"]
+            with zipfile.ZipFile(tmp / "books.zip") as z:
+                assert sorted(z.namelist()) == ["test/a.txt", "train/b.txt", "train/c.txt"]
+                assert z.read("test/a.txt") == (tmp / "test" / "a.txt").read_bytes()
+    finally:
+        prepare.TEST_BOOKS = keep
+    assert 0.25 < split["a"]["seen"] < 0.4, split["a"]["seen"]
     print("[ok] prepare: book text kept, library text / footnotes / colophon / foreign lines removed, "
-          "look-alike letters repaired, a 90% copy skipped")
+          f"look-alike letters repaired, a 90% copy skipped; test books split off, {split['a']['seen']:.0%} "
+          "overlap with a training book reported, both packed in one zip")
 
 
 def test_training_and_resume() -> None:
@@ -189,6 +240,15 @@ def test_training_and_resume() -> None:
             a, b = (torch.load(tmp / optimizer / d / "model.pt", weights_only=False)["model"] for d in ("a", "b"))
             assert all(torch.equal(a[k], b[k]) for k in a)
             report.append(f"{optimizer} {first[1]:.2f} -> {last[1]:.2f}")
+
+        # --ckpt-minutes: the checks skip the checkpoint until that much time has passed, a pause
+        # still writes one, and the run resumed from it is the unbroken run.
+        sparse = common + ["--ckpt-minutes", "999"]                    # common and straight: the Muon run
+        train.main(sparse + ["--out", str(tmp / "s0")])
+        assert not (tmp / "s0" / "ckpt.pt").exists()
+        assert train.main(sparse + ["--out", str(tmp / "s1"), "--stop-after", "45"]) == {"paused_at": 45}
+        assert train.main(sparse + ["--out", str(tmp / "s1"), "--resume"])["history"] == straight["history"]
+        assert not list((tmp / "s1").glob("*.tmp"))                    # the write-then-rename left nothing behind
 
         # generate.py continues a prompt with a trained model. The same seed gives the same text,
         # and a prompt longer than the context window keeps its end instead of failing.
@@ -219,8 +279,8 @@ def test_training_and_resume() -> None:
                            "--eval-interval", "10", "--warmup", "1", "--lr", "0.5", "--threads", "2", "--sample", ""])
         kept = torch.load(tmp / "d" / "model.pt", weights_only=False)
         assert harm["best_raw"][1] == 0 and all(torch.equal(kept["model"][k], start["model"][k]) for k in start["model"])
-    print(f"[ok] training: loss in 60 steps, {' and '.join(report)}; pause + resume reproduces the unbroken run exactly; "
-          f"generate.py continues a prompt, the same seed gives the same text")
+    print(f"[ok] training: loss in 60 steps, {' and '.join(report)}; pause + resume reproduces the unbroken run exactly, "
+          f"also with --ckpt-minutes; generate.py continues a prompt, the same seed gives the same text")
 
 
 def test_memory() -> None:

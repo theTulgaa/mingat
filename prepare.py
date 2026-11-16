@@ -2,12 +2,14 @@
 prepare.py — turn books into clean training text
 ================================================
 
-    python prepare.py                                   # data/novels/ -> data/clean/
-    python prepare.py --src data/novels --out data/clean
-    python train.py --data data/clean                   # then train on the result
+    python prepare.py                                   # data/novels/ -> data/clean/ and data/test/
+    python prepare.py --zip data/mingat_books.zip       # ... and one zip of both, for Google Drive / Colab
+    python train.py --data data/clean --test data/test  # then train on the result
 
-Every .epub and .txt file in --src becomes one clean UTF-8 .txt file in --out. A report
-follows: what each book gave, what was removed, and anything that looks wrong.
+Every .epub and .txt file in --src becomes one clean UTF-8 .txt file in --out. The books in
+TEST_BOOKS go to --test-out instead: no model trains on them, so every model's score on them
+can be compared with every other's. A report follows: what each book gave, what was removed,
+anything that looks wrong, and whether any training book contains passages of a test book.
 
 What is removed, and why. The books so far all come from the e-nom.mn digital library, so
 some rules name its exact phrases; the others are general.
@@ -242,6 +244,11 @@ RUSSIAN_WORDS = {"и", "в", "во", "на", "не", "что", "с", "со", "п
 COLOPHON = re.compile(r"Цаасны хэмжээ|Хэвлэлийн хуудас|Хэв\. ?хуудас|Хэвлэсэн тоо|^(?:Зах|За|Захиалсан)\.? ?№|"
                       r"^Х\. ?Г\. ?№|^ХГ ?№|^Үнэ \d|\bISBN\b|^©|\d (?:хувь|ширхэг) хэвлэв|(?:үйлдвэрт|комбинатад) хэвлэв|"
                       r"^Техн(?:ик|\.) ?ред|^Хянагч [А-ЯӨҮЁ]\.|^Өрөлтөд \d|^Хэвлэлтэд \d", re.IGNORECASE)
+TEST_BOOKS = (            # the fixed test set (0.66 MB): every bits-per-byte score in the README is on these
+    "BOKhIIN_TUKhAI_DOMGUUD_-_AAZ", "SINDBAD_DALAIChIN_-_AAZ",
+    "GAIKhAMShGIIN_NEVTERKhII_TOL'_-_2_Vladimir_Miezientsiev", "TsETsEN_BER_-_AAZ",
+    "DORZhSURENGIIN_NOIR_KhULZhSAN_N_-_Ch._Chimid", "MUKhAR_GUDAMZhIND_-_Sh._GAADAMBA",
+)
 HEAD_LINES = 15           # the e-library's notes on the source edition sit in a book's first lines
 TAIL_SHARE = 0.3          # footnotes and publication data are only cut from the last 30% of the text
 COLOPHON_LINES = 40       # printer's lines are only looked for among the last 40 lines
@@ -375,6 +382,10 @@ def main(argv=None) -> Dict[str, dict]:
     ap = argparse.ArgumentParser(description="Turn .epub and .txt books into clean training text.")
     ap.add_argument("--src", type=Path, default=Path("data/novels"), help="folder of .epub / .txt books")
     ap.add_argument("--out", type=Path, default=Path("data/clean"), help="folder for the clean .txt files")
+    ap.add_argument("--test-out", type=Path, default=Path("data/test"),
+                    help="folder for the books in TEST_BOOKS, which no model trains on")
+    ap.add_argument("--zip", type=Path, help="also pack --out and --test-out into one zip (train/, test/), "
+                                             "e.g. to upload to Google Drive for train_colab.ipynb")
     ap.add_argument("--duplicate", type=float, default=0.5,
                     help="skip a book when this share of its 8-word passages is found in other books")
     args = ap.parse_args(argv)
@@ -402,13 +413,14 @@ def main(argv=None) -> Dict[str, dict]:
 
     # Duplicates: going from the smallest book up, skip a book whose passages are mostly
     # found in the books still kept. `owners` counts the kept books that contain a passage.
+    # A test book is never skipped; if a training book holds its text, the check below says so.
     sh = {name: shingles(b["text"]) for name, b in books.items()}
     owners = Counter()
     for s in sh.values():
         owners.update(s)
     for name in sorted(books, key=lambda n: len(books[n]["text"])):
         shared = sum(1 for s in sh[name] if owners[s] > 1) / max(1, len(sh[name]))
-        if shared >= args.duplicate:
+        if shared >= args.duplicate and name not in TEST_BOOKS:
             kept_books = [o for o in books if o != name and not books[o].get("duplicate_of")]
             books[name]["duplicate_of"] = max(kept_books, key=lambda o: len(sh[name] & sh[o]))
             books[name]["shared"] = shared
@@ -419,28 +431,53 @@ def main(argv=None) -> Dict[str, dict]:
     total_raw = total_clean = words = 0
     print(f"\n{'book':<44} {'read':>7} {'clean':>7} {'words':>8} {'Ө/Ү':>5} {'Latin':>6}   removed / notes")
     for name, b in books.items():
-        target = args.out / f"{name}.txt"
+        test = name in TEST_BOOKS
+        target = (args.test_out if test else args.out) / f"{name}.txt"
         if b.get("duplicate_of"):
             if target.exists():
                 target.unlink()
             print(f"{name[:44]:<44} {b['raw'] / 1e6:6.2f}M  skipped: {b['shared']:.0%} of it is in {b['duplicate_of']}")
             continue
+        if test:
+            args.test_out.mkdir(parents=True, exist_ok=True)
+            (args.out / f"{name}.txt").unlink(missing_ok=True)       # a copy from before the split
         target.write_text(b["text"], encoding="utf-8")
         n_bytes = len(b["text"].encode("utf-8"))
         h = health(b["text"])
-        b.update(clean=n_bytes, words=len(b["text"].split()), health=h)
-        total_raw, total_clean, words = total_raw + b["raw"], total_clean + n_bytes, words + b["words"]
+        b.update(clean=n_bytes, words=len(b["text"].split()), health=h, test=test)
+        if not test:
+            total_raw, total_clean, words = total_raw + b["raw"], total_clean + n_bytes, words + b["words"]
         notes = [f"{k} {v / 1e3:.1f}k" if k != "repaired words" else f"{v} repaired words"
                  for k, v in sorted(b["removed"].items()) if v]
         print(f"{name[:44]:<44} {b['raw'] / 1e6:6.2f}M {n_bytes / 1e6:6.2f}M {b['words']:>8,} {h['өү']:5.1%} {h['latin']:6.2%}   "
-              + ", ".join(notes + [f"CHECK: {f}" for f in flags(h, n_bytes)]))
-    kept = sum(1 for b in books.values() if not b.get("duplicate_of"))
-    print(f"\n{kept} books -> {args.out}: {total_clean / 1e6:.2f} MB of text ({total_raw / 1e6:.2f} MB read), {words:,} words")
+              + ", ".join((["TEST BOOK"] if test else []) + notes + [f"CHECK: {f}" for f in flags(h, n_bytes)]))
+    train_books = [n for n, b in books.items() if not b.get("duplicate_of") and not b.get("test")]
+    test_books = [n for n, b in books.items() if b.get("test")]
+    print(f"\n{len(train_books)} books -> {args.out}: {total_clean / 1e6:.2f} MB of text ({total_raw / 1e6:.2f} MB read), "
+          f"{words:,} words")
+
+    # The test books must stay unseen: how much of each one's text is also in a training book.
+    if test_books:
+        seen = set().union(*(sh[n] for n in train_books))
+        print(f"{len(test_books)} test books -> {args.test_out}: "
+              f"{sum(books[n]['clean'] for n in test_books) / 1e6:.2f} MB. Their 8-word passages found in the training books:")
+        for n in test_books:
+            share = len(sh[n] & seen) / max(1, len(sh[n]))
+            books[n]["seen"] = share
+            print(f"    {n[:44]:<44} {share:6.2%}" + ("   CHECK: no longer unseen" if share > 0.01 else ""))
     stale = [p.name for p in sorted(args.out.glob("*.txt")) if p.stem not in books]
     if stale:
         print(f"note: {len(stale)} .txt file(s) in {args.out} are not from {args.src} and will be trained on too: "
               + ", ".join(stale))
-    print(f"next: python train.py --data {args.out.as_posix()}")
+
+    if args.zip:                                    # one file to upload: train/*.txt and test/*.txt
+        args.zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(args.zip, "w", zipfile.ZIP_DEFLATED) as z:
+            for folder, inside in ((args.out, "train"), (args.test_out, "test")):
+                for p in sorted(folder.glob("*.txt")) if folder.is_dir() else []:
+                    z.write(p, f"{inside}/{p.name}")
+        print(f"packed {args.zip}: {args.zip.stat().st_size / 1e6:.1f} MB")
+    print(f"next: python train.py --data {args.out.as_posix()}" + (f" --test {args.test_out.as_posix()}" if test_books else ""))
     return books
 
 
