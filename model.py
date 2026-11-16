@@ -57,6 +57,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+# Denormal numbers (smaller than 1.2e-38) are slow on x86 CPUs, often 10-100 times slower
+# per operation. The activations of a model trained longer can be full of them: on this CPU
+# the `small` model trained for 12 passes took 11-20 s per forward pass of 8 x 128 tokens
+# instead of 0.5 s. Rounding them to zero changes no measurable result (the same bits per
+# byte to 4 decimals) and gives the speed back. It sets a CPU mode; a GPU is unaffected.
+torch.set_flush_denormal(True)
+
 IGNORE_INDEX = -100  # label value excluded from the loss (prompt tokens, padding)
 
 

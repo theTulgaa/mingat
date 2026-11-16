@@ -534,8 +534,8 @@ def main(argv=None) -> dict:
           (f" | test loss {result['test']['loss']:.3f}" if test_text else "") +
           f" | saved {args.out / 'model.pt'}")
 
-    if args.sample:     # start the way documents start in the corpus: the separator, a newline, the text
-        prompt = torch.tensor([tok.encode("<|endoftext|>\n", allow_special=True) + tok.encode(args.sample)], device=device)
+    if args.sample:     # mid-text, as generate.py does (at a book start the model writes titles and verse)
+        prompt = torch.tensor([tok.encode(args.sample)], device=device)
         out = model.generate(prompt, max_new_tokens=60, temperature=0.7, top_p=0.9,
                              repetition_penalty=1.1, eos_token_id=tok.eot_id)
         print("sample:", tok.decode(out[0].tolist()).replace("\n", " "))

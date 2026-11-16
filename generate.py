@@ -4,6 +4,7 @@ generate.py — write with a trained model
 
     python generate.py --model out/model.pt                        # type the start of a text, it continues
     python generate.py --model out/model.pt --prompt "Тэр өдөр"    # one continuation, then exit
+    python generate.py --prompt "Тэр өдөр" --book-start            # the prompt where a book begins (titles, verse)
 
 The model only continues text. It has read books, not conversations, so it does not answer
 questions yet; that comes later, with fine-tuning (persona.py). Start a sentence and let it
@@ -33,13 +34,19 @@ from memory import load_model
 
 
 def continue_text(model, tok, prompt: str, tokens: int, temperature: float, top_p: float,
-                  repetition_penalty: float) -> str:
+                  repetition_penalty: float, book_start: bool = False) -> str:
     """The prompt followed by the model's continuation.
 
-    The prompt goes after the document separator, the way every book starts in training, so
-    the model reads it as the beginning of a text. If the prompt and the continuation do not
-    fit in the context window together, only the end of the prompt is kept."""
-    start = tok.encode("<|endoftext|>\n", allow_special=True)
+    The prompt stands alone, like a passage from the middle of a book, which is where most
+    training windows start. With book_start, and always for an empty prompt, it goes after
+    the document separator, where a book begins. Books begin with titles, contents pages,
+    epigraphs and verse, and so does the model there. Measured on 60 samples per model
+    (November 16): mid-text, `small` finished the sentence the prompt began in 88% of them
+    and wrote 7.5% of its words on short verse-like lines; at a book start, 70% and 30%.
+    If the prompt and the continuation do not fit in the context window together, only the
+    end of the prompt is kept."""
+    separator = book_start or not prompt.strip()
+    start = tok.encode("<|endoftext|>\n", allow_special=True) if separator else []
     tokens = max(1, min(tokens, model.config.max_seq_len - len(start) - 1))
     ids = tok.encode(prompt)                                   # typed text: never a control token
     ids = ids[-(model.config.max_seq_len - len(start) - tokens):]
@@ -58,6 +65,8 @@ def main(argv: Optional[List[str]] = None) -> List[str]:
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--repetition-penalty", type=float, default=1.1)
     ap.add_argument("--seed", type=int, help="fix the randomness: the same seed gives the same text")
+    ap.add_argument("--book-start", action="store_true",
+                    help="put the prompt where a book begins, as before November 16: more titles, contents lines, verse")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args(argv)
     for stream in (sys.stdin, sys.stdout, sys.stderr):
@@ -72,7 +81,7 @@ def main(argv: Optional[List[str]] = None) -> List[str]:
     model, tok = load_model(args.model)
     model.to(args.device)
     settings = dict(tokens=args.tokens, temperature=args.temperature, top_p=args.top_p,
-                    repetition_penalty=args.repetition_penalty)
+                    repetition_penalty=args.repetition_penalty, book_start=args.book_start)
 
     if args.prompt is not None:
         text = continue_text(model, tok, args.prompt, **settings)

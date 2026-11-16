@@ -120,7 +120,8 @@ The first three new runs shared the CPU (6 threads each). The 6-epoch run had it
   0.944 on validation, 1.018 on the test). Compare models on books none of them trained on.
 
 What the difference looks like in the writing, from 60 samples per model (6 prompts × 10
-seeds, 100 tokens each, `generate.py`'s settings):
+seeds, 100 tokens each, `generate.py`'s settings; the prompt at the start of a book, as
+`generate.py` placed it until November 16):
 
 | | First model | nano, dropout 0.2 | nano, dropout 0.1 | micro, 2 epochs | micro, 6 epochs |
 |---|---|---|---|---|---|
@@ -143,8 +144,9 @@ test books its loss per token is 3.78 nats at positions 64–127 of a long windo
 128–191 and 4.87 at 384–511. `generate.py`'s default of 100 tokens stays inside the window;
 past about 120 tokens (`/len 150` and up) the text falls apart.
 
-Not measured on the books yet: more than 6 epochs, dropout 0 for `micro`, a longer context
-(256 tokens), a larger vocabulary (4,096 or 8,192) and the `small` preset (it needs a GPU).
+Not measured on these 40 books: dropout 0 for `micro`, a longer context (256 tokens) and a
+larger vocabulary (4,096 or 8,192). More passes and the `small` preset were measured on the
+103 books of November 16, on a GPU: see [Training on a Colab GPU](#training-on-a-colab-gpu).
 
 The better path, when you have public Mongolian text as well (see the measurements below):
 
@@ -182,6 +184,97 @@ Muon, weight averaging), so the differences come from the books, the size and th
 disconnect costs at most 10 minutes: each run writes its checkpoint to the Drive every 10 minutes
 (`--ckpt-minutes 10`), and running the notebook again skips the finished runs and continues the
 interrupted one.
+
+**From a terminal, with no browser: the Colab CLI.** Google's [Colab CLI](https://github.com/googlecolab/google-colab-cli)
+(June 2026) rents the same GPU from the command line, which also lets a coding agent run the whole
+thing. It officially supports Linux and macOS; on this Windows PC version 0.8.0 did everything
+below. In Git Bash set `MSYS_NO_PATHCONV=1` first, or `/content/...` turns into a Windows path.
+
+```bash
+python -m venv .colab-cli && .colab-cli/Scripts/pip install google-colab-cli   # .colab-cli/ is gitignored
+.colab-cli/Scripts/colab sessions        # the first call signs you in: open the link, paste the code back
+colab new -s mingat --gpu T4             # a free account got a T4
+colab upload -s mingat data/mingat_books.zip /content/mingat_books.zip
+colab exec -s mingat -f setup.py         # git clone this repo, unzip the books into /content/books
+colab exec -s mingat --timeout 0 -f job.py   # python sweep.py --data /content/books/train --test /content/books/test --out /content/runs
+colab download -s mingat /content/runs/micro_6ep/model.pt out/runs/micro_6ep/model.pt
+colab stop -s mingat                     # give the GPU back
+```
+
+`--timeout 0` matters: by default `exec` gives up after 30 seconds without output. `download`
+works while a long `exec` is still running, so each run can be fetched as soon as it finishes.
+On the T4, `micro` trains at about 41,000 tokens per second, 20 times this CPU.
+
+#### Results, November 16
+
+The three runs on a free T4, through the Colab CLI, scored on the same six test books as the
+table in [Training on the books](#training-on-the-books):
+
+| Model | Training text | Passes | Time | Test, bits per byte |
+|---|---|---|---|---|
+| `micro`, the model above | 40 books, 18 MB | 6 | 137 min on the CPU | 1.018 |
+| `micro` | 103 books, 41 MB | 6 | 18 min | 0.988 |
+| `small` (19.7M parameters) | 103 books | 6 | 31 min | 0.955 |
+| **`small`** | 103 books | 12 | 63 min | **0.942** |
+
+| Test book | 1.018 model | `micro`, 6 passes | `small`, 6 | `small`, 12 |
+|---|---|---|---|---|
+| *Бөхийн тухай домгууд* | 1.043 | 1.028 | 0.993 | 0.983 |
+| *Доржсүрэнгийн нойр хулжсан нь* | 1.063 | 1.009 | 0.978 | 0.951 |
+| *Гайхамшгийн нэвтэрхий толь – 2* | 1.024 | 0.981 | 0.948 | 0.937 |
+| *Мухар гудамжинд* | 1.128 | 1.097 | 1.067 | 1.056 |
+| *Синдбад далайчин* | 0.969 | 0.931 | 0.900 | 0.881 |
+| *Цэцэн бэр* | 0.973 | 0.940 | 0.914 | 0.905 |
+
+- **More books, the same recipe:** 1.018 → 0.988, and every test book improved, by 0.015 to 0.054.
+- **A bigger model:** `small` beat `micro` on every test book, 0.955 against 0.988, with the same
+  number of passes. On 1 MB a bigger model did not help; on 41 MB it does.
+- **More passes:** 12 against 6, 0.942 against 0.955, every book better again. The validation
+  loss was still falling at the last checks, so more than 12 passes may help too; not measured.
+- The validation text ranked the three runs the same way (0.956, 0.918, 0.903 bits per byte).
+
+`out/model.pt` is the 12-pass `small` model, which `generate.py` uses by default.
+
+What the models write, from 60 samples each (6 prompts × 10 seeds, 100 tokens, `generate.py`'s
+settings, the prompt placed mid-text as `generate.py` now does; see below):
+
+| | Sentences per 100 words | Words per sentence | Endings like the books' | Prompt's sentence finished | Short verse-like lines | Repeated word triples | Real words |
+|---|---|---|---|---|---|---|---|
+| The books: test / training | 6.9 / 8.1 | 11.9 / 10.6 | 95% / 86% | 100% | 2.0% / 4.6% | 0.1% | 99.8% / 99.9% |
+| 1.018 model | 9.3 | 8.6 | 91.4% | 93.3% | 4.3% | 0.8% | 98.9% |
+| `micro`, 6 passes | 9.3 | 8.0 | 93.3% | 86.7% | 6.3% | 1.5% | 99.2% |
+| `small`, 6 passes | 9.2 | 8.5 | 94.3% | 88.3% | 7.5% | 1.2% | 99.4% |
+| `small`, 12 passes | 9.9 | 8.1 | 94.7% | 93.3% | 6.8% | 1.7% | 99.5% |
+
+The 12-pass model writes the fewest wrong words (one ordinary word in 200 is not in the books,
+against one in 90 for the 1.018 model) and ends its sentences most like the books. It repeats
+itself more (1.7% of its word triples), and its sentences are shorter than the books'. The
+longest passage copied word for word from the training books was 7 to 9 words for every model.
+Two of its seed-0 continuations:
+
+> Тэр өдөр, мөн тэндхийн оргилуурын хөвөөнд байсан бүх хүмүүс, ялангуяа Роберта Олден авхайг
+> дагуулан оргож, ой модоор уруудан явжээ.
+
+> Чингис хаан, Чингис хааны зарлигийг эсэргүүцсэн тул Борохул, Алтан хаан, Ван хаан хоёр гурван
+> удаа зарлиг болов. Тэндээс Алтан хаан, Хачар тэргүүтэн гурван түмэн хүнтэй хамт ирэв.
+
+The second has the right names and invented events: the model writes like the history books, it
+does not know their facts (see [What a small private corpus can give](#what-a-small-private-corpus-can-give)).
+
+**Where the prompt goes.** Until November 16, `generate.py` put the prompt after the document
+separator, where a book begins. Books begin with titles, contents pages, epigraphs and verse, and
+the new books brought more of them. There, the 6-pass `small` finished the sentence its prompt
+began in 70% of the samples and wrote 30% of its words on short verse-like lines. With the prompt
+in the middle of a text, where most training windows start, the same model finished 88% and wrote
+7.5%. Every model behaved this way (the 1.018 model: 77% → 93% finished, 12% → 4% verse-like). So
+`generate.py` now places the prompt mid-text. `--book-start` brings back the old placement, and an
+empty prompt still starts a new book.
+
+**A model trained longer was 40 times slower on the CPU.** The 12-pass model took 11 to 20 seconds
+per forward pass of 8 × 128 tokens on this CPU, against 0.2 to 0.6 s for the 6-pass one. Its
+activations were full of denormal numbers (smaller than 1.2e-38), which x86 CPUs handle very
+slowly. `model.py` now rounds them to zero with `torch.set_flush_denormal(True)`: 0.16 s, the same
+bits per byte to 4 decimals, and the 60-step CPU training gives the same numbers, bit for bit.
 
 ## What a small private corpus can give
 
@@ -728,7 +821,7 @@ learned from text: more books, more passes, a bigger model.
 - [x] Trained on the 46 books: `micro`, 6 epochs, 1.018 bits per byte on six unseen books (the first model: 1.320)
 - [x] `train.py`: small-corpus recipe, validated by experiments; `--init`, pause and resume
 - [x] `sweep.py` and `train_colab.ipynb`: training on a free Colab GPU that survives disconnects; the six test books fixed in `prepare.py`
-- [ ] The GPU runs on the 103 books of November 16 (`micro` and `small`), scored on the six test books
+- [x] Trained on the 103 books of November 16 on a Colab T4: `small`, 12 passes, 0.942 bits per byte on the six test books (`out/model.pt`)
 - [x] `memory.py`: voting and recall, tuned on held-out text
 - [x] `persona.py`: chat format, SFT / DPO / ORPO losses, trait measurements
 - [x] `program_qa.py`: weight-space programming experiment

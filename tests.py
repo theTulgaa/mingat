@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import generate
 import prepare
 import train
-from memory import RECALL_K, Memory, collect, mixture_loss, prompt_starts, recitation
+from memory import RECALL_K, Memory, collect, load_model, mixture_loss, prompt_starts, recitation
 from model import ModelConfig, MongolHistorySLM
 from tokenizer import _SAMPLE, BPETokenizer
 
@@ -265,6 +265,10 @@ def test_training_and_resume() -> None:
         assert once == again and once[0].startswith("Чингис хаан"), (once, again)
         long = generate.main(["--model", trained, "--prompt", "Чингис хаан 1162 онд төрсөн. " * 200, "--tokens", "8"])
         assert len(long) == 1 and "төрсөн" in long[0]
+        book = generate.main(["--model", trained, "--prompt", "Чингис хаан", "--tokens", "8", "--seed", "0", "--book-start"])
+        assert book[0].startswith("Чингис хаан"), book                 # the prompt after the document separator
+        model_, tok_ = load_model(trained)
+        assert isinstance(generate.continue_text(model_, tok_, "", 8, 0.7, 0.9, 1.1), str)   # Enter alone: a text of its own
 
         # --init continues a trained model on new text: same tokenizer and size, and it starts
         # from what the model already knows, not from scratch.
